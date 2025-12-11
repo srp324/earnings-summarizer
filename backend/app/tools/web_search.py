@@ -3,7 +3,7 @@
 from langchain.tools import BaseTool
 from pydantic import BaseModel, Field
 from typing import Optional, Type
-from duckduckgo_search import DDGS
+from ddgs import DDGS
 import httpx
 
 
@@ -26,8 +26,22 @@ class WebSearchTool(BaseTool):
     def _run(self, query: str) -> str:
         """Execute web search."""
         try:
-            with DDGS() as ddgs:
-                results = list(ddgs.text(query, max_results=10))
+            # Try with retry logic
+            max_retries = 2
+            results = []
+            
+            for attempt in range(max_retries):
+                try:
+                    with DDGS() as ddgs:
+                        results = list(ddgs.text(query, max_results=10))
+                        break  # Success, exit retry loop
+                except Exception as ddgs_err:
+                    if attempt < max_retries - 1:
+                        import time
+                        time.sleep(1)  # Wait before retry
+                        continue
+                    else:
+                        raise ddgs_err
                 
             if not results:
                 return "No search results found."
@@ -42,7 +56,7 @@ class WebSearchTool(BaseTool):
             
             return "\n\n".join(formatted_results)
         except Exception as e:
-            return f"Search error: {str(e)}"
+            return f"Search error: {str(e)}. The search service may be temporarily unavailable."
     
     async def _arun(self, query: str) -> str:
         """Async execution of web search."""
