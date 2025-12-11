@@ -23,6 +23,10 @@ wheels/
 venv/
 ENV/
 
+# uv
+.uv/
+uv.lock
+
 # Node
 node_modules/
 npm-debug.log*

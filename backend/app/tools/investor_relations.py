@@ -2,11 +2,14 @@
 
 from langchain.tools import BaseTool
 from pydantic import BaseModel, Field
-from typing import Type, List, Dict, Optional
+from typing import Type, List, Dict, Optional, ClassVar
 from urllib.parse import urljoin, urlparse
 import httpx
 from bs4 import BeautifulSoup
 import re
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class FindIRSiteInput(BaseModel):
@@ -26,7 +29,7 @@ class InvestorRelationsTool(BaseTool):
     args_schema: Type[BaseModel] = FindIRSiteInput
     
     # Common IR URL patterns
-    IR_PATTERNS = [
+    IR_PATTERNS: ClassVar[List[str]] = [
         "investor.{domain}",
         "investors.{domain}",
         "ir.{domain}",
@@ -35,11 +38,89 @@ class InvestorRelationsTool(BaseTool):
         "{domain}/ir",
     ]
     
+    # Known IR URLs for major companies (fallback)
+    KNOWN_IR_URLS: ClassVar[Dict[str, str]] = {
+        # Tech companies
+        "AAPL": "https://investor.apple.com",
+        "APPLE": "https://investor.apple.com",
+        "MSFT": "https://www.microsoft.com/en-us/investor",
+        "MICROSOFT": "https://www.microsoft.com/en-us/investor",
+        "GOOGL": "https://abc.xyz/investor/",
+        "GOOG": "https://abc.xyz/investor/",
+        "GOOGLE": "https://abc.xyz/investor/",
+        "ALPHABET": "https://abc.xyz/investor/",
+        "AMZN": "https://ir.aboutamazon.com",
+        "AMAZON": "https://ir.aboutamazon.com",
+        "META": "https://investor.fb.com",
+        "FACEBOOK": "https://investor.fb.com",
+        "NVDA": "https://investor.nvidia.com",
+        "NVIDIA": "https://investor.nvidia.com",
+        "TSLA": "https://ir.tesla.com",
+        "TESLA": "https://ir.tesla.com",
+        "NFLX": "https://ir.netflix.net",
+        "NETFLIX": "https://ir.netflix.net",
+        "AMD": "https://ir.amd.com",
+        "INTC": "https://www.intc.com/investor-relations",
+        "INTEL": "https://www.intc.com/investor-relations",
+        "ORCL": "https://investor.oracle.com",
+        "ORACLE": "https://investor.oracle.com",
+        "CRM": "https://investor.salesforce.com",
+        "SALESFORCE": "https://investor.salesforce.com",
+        "ADBE": "https://www.adobe.com/investor-relations.html",
+        "ADOBE": "https://www.adobe.com/investor-relations.html",
+        # Other major companies
+        "WMT": "https://stock.walmart.com",
+        "WALMART": "https://stock.walmart.com",
+        "JPM": "https://www.jpmorganchase.com/ir",
+        "BAC": "https://investor.bankofamerica.com",
+        "V": "https://investor.visa.com",
+        "VISA": "https://investor.visa.com",
+        "MA": "https://investor.mastercard.com",
+        "MASTERCARD": "https://investor.mastercard.com",
+        "JNJ": "https://www.investor.jnj.com",
+        "PG": "https://www.pginvestor.com",
+        "DIS": "https://www.thewaltdisneycompany.com/investors/",
+        "DISNEY": "https://www.thewaltdisneycompany.com/investors/",
+        "KO": "https://investors.coca-colacompany.com",
+    }
+    
     def _run(self, company_name: str) -> str:
         """Find investor relations site."""
-        from duckduckgo_search import DDGS
+        company_upper = company_name.upper().strip()
         
+        # First, check if we have a known IR URL for this company
+        if company_upper in self.KNOWN_IR_URLS:
+            known_url = self.KNOWN_IR_URLS[company_upper]
+            logger.info(f"Using known IR URL for {company_name}: {known_url}")
+            
+            # Verify the URL is accessible
+            try:
+                headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+                with httpx.Client(timeout=10.0, follow_redirects=True) as client:
+                    response = client.head(known_url, headers=headers)
+                    if response.status_code < 400:
+                        return f"""**Investor Relations Site Found for '{company_name}':**
+
+**Official IR Site:** {known_url}
+
+This is the official investor relations website where you can find:
+- Latest earnings reports (10-K, 10-Q)
+- Press releases and announcements
+- Financial statements
+- SEC filings
+- Earnings call transcripts
+
+You can use the extract_earnings_links tool to find specific documents on this site."""
+            except Exception as e:
+                logger.warning(f"Known URL {known_url} not accessible: {e}")
+                # Continue to search fallback
+        
+        # Fallback to web search
         try:
+            from ddgs import DDGS
+            
+            logger.info(f"Searching for IR site for {company_name}")
+            
             # Search for investor relations page
             search_queries = [
                 f"{company_name} investor relations",
@@ -48,13 +129,21 @@ class InvestorRelationsTool(BaseTool):
             ]
             
             all_results = []
-            with DDGS() as ddgs:
-                for query in search_queries:
-                    results = list(ddgs.text(query, max_results=5))
-                    all_results.extend(results)
+            try:
+                with DDGS() as ddgs:
+                    for query in search_queries:
+                        try:
+                            results = list(ddgs.text(query, max_results=5))
+                            all_results.extend(results)
+                        except Exception as search_err:
+                            logger.warning(f"Search query '{query}' failed: {search_err}")
+                            continue
+            except Exception as ddgs_err:
+                logger.error(f"DuckDuckGo search failed: {ddgs_err}")
+                return f"Unable to search for investor relations page for {company_name}. The search service is temporarily unavailable. You can try providing the direct investor relations URL if you know it."
             
             if not all_results:
-                return f"No investor relations page found for {company_name}"
+                return f"No investor relations page found for {company_name}. Please try providing the company's official investor relations URL directly."
             
             # Score and rank results
             scored_results = []
@@ -142,7 +231,7 @@ class ExtractEarningsLinksTool(BaseTool):
     """
     args_schema: Type[BaseModel] = ExtractEarningsLinksInput
     
-    EARNINGS_KEYWORDS = [
+    EARNINGS_KEYWORDS: ClassVar[List[str]] = [
         'earnings', 'quarterly', 'annual', '10-k', '10-q', '10k', '10q',
         'financial results', 'fiscal', 'q1', 'q2', 'q3', 'q4',
         'fy20', 'fy21', 'fy22', 'fy23', 'fy24',

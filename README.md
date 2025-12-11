@@ -55,6 +55,7 @@ A multi-agent AI application that automatically analyzes and summarizes stock ea
 ### Prerequisites
 
 - Python 3.11+
+- [uv](https://github.com/astral-sh/uv) (Python package manager)
 - Node.js 18+
 - Docker & Docker Compose (recommended)
 - OpenAI API key
@@ -72,6 +73,8 @@ A multi-agent AI application that automatically analyzes and summarizes stock ea
 2. **Start all services:**
    ```bash
    docker-compose up --build
+   # Or with Make:
+   make docker-up
    ```
 
 3. **Access the application:**
@@ -81,17 +84,45 @@ A multi-agent AI application that automatically analyzes and summarizes stock ea
 
 ### Option 2: Manual Setup
 
+**Quick Start (using Make):**
+```bash
+# Install all dependencies
+make install
+
+# Start development servers
+make dev
+```
+
 #### Backend Setup
 
+**Quick Setup (using setup script):**
 ```bash
 cd backend
 
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+# macOS/Linux:
+chmod +x setup.sh && ./setup.sh
 
-# Install dependencies
-pip install -r requirements.txt
+# Windows PowerShell:
+# .\setup.ps1
+```
+
+**Manual Setup:**
+```bash
+cd backend
+
+# Install uv (if not already installed)
+# macOS/Linux:
+curl -LsSf https://astral.sh/uv/install.sh | sh
+# Windows:
+# powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
+
+# Create virtual environment and install dependencies with uv
+uv venv
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+
+# Install dependencies (much faster than pip!)
+uv pip install -r requirements.txt
+# Or use: uv sync (if using pyproject.toml)
 
 # Install Playwright browsers (for web scraping)
 playwright install chromium
@@ -277,9 +308,10 @@ npm run lint
 
 1. Fork the repository
 2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
+3. Install dependencies with `uv sync`
+4. Commit your changes (`git commit -m 'Add amazing feature'`)
+5. Push to the branch (`git push origin feature/amazing-feature`)
+6. Open a Pull Request
 
 ## 📄 License
 
@@ -292,4 +324,5 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - [FastAPI](https://fastapi.tiangolo.com/) - Backend framework
 - [React](https://react.dev/) - Frontend framework
 - [pgvector](https://github.com/pgvector/pgvector) - Vector similarity search
+- [uv](https://github.com/astral-sh/uv) - Fast Python package manager
 

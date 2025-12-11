@@ -8,9 +8,14 @@ RUN apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies
+# Install uv and Python dependencies
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY pyproject.toml* ./
+
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
+    /root/.local/bin/uv pip install --system -r requirements.txt
+
+ENV PATH="/root/.local/bin:$PATH"
 
 # Install Playwright browsers for web scraping
 RUN playwright install chromium
