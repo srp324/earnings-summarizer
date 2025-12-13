@@ -21,6 +21,12 @@ class Settings(BaseSettings):
     llm_model: str = "gpt-4.1-mini"
     llm_temperature: float = 0.1
     
+    # RAG Settings
+    rag_chunk_size: int = 1000  # Characters per chunk
+    rag_chunk_overlap: int = 200  # Overlap between chunks
+    rag_top_k: int = 10  # Number of chunks to retrieve for summarization
+    rag_enabled: bool = True  # Enable RAG for transcript processing
+    
     model_config = SettingsConfigDict(
         # Look for .env in the backend directory (where run.py is)
         env_file=[".env", "../.env"],  # Try backend/.env first, then root/.env

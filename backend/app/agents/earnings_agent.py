@@ -19,6 +19,8 @@ import logging
 
 from app.config import get_settings
 from app.tools.investor_relations import TranscriptListTool, TranscriptTool
+from app.rag import get_rag_service
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -174,6 +176,100 @@ Then immediately use list_earnings_transcripts to get the available earnings tra
             "requested_quarter": requested_quarter
         }
     
+    async def store_embeddings(state: EarningsAgentState) -> Dict[str, Any]:
+        """Store transcript embeddings in database for RAG retrieval."""
+        try:
+            settings = get_settings()
+            if not getattr(settings, "rag_enabled", True):
+                logger.info("RAG is disabled, skipping embedding storage")
+                return {"current_stage": "storing_embeddings"}
+            
+            # Extract transcript information from messages
+            messages_list = list(state["messages"])
+            
+            ticker_symbol = state.get("ticker_symbol")
+            requested_fiscal_year = state.get("requested_fiscal_year")
+            requested_quarter = state.get("requested_quarter")
+            
+            # Find transcript content in tool messages
+            transcript_content = None
+            source_url = None
+            
+            for msg in reversed(messages_list):
+                if hasattr(msg, 'content') and msg.content:
+                    content_str = str(msg.content)
+                    # Look for transcript indicators
+                    if "Earnings Call Transcript" in content_str or "discountingcashflows.com" in content_str:
+                        if len(content_str) > 1000 and not any(template in content_str.lower() for template in [
+                            'market is open', 'after-hours quote', 'last quote from'
+                        ]):
+                            transcript_content = content_str
+                            # Extract source URL if present
+                            url_match = re.search(r'_Source URL: (https?://[^\s_]+)_', content_str)
+                            if url_match:
+                                source_url = url_match.group(1)
+                            break
+            
+            # Extract transcript content (remove metadata headers)
+            transcript_body = None
+            if transcript_content:
+                # Remove the header metadata
+                lines = transcript_content.split('\n')
+                start_idx = 0
+                for i, line in enumerate(lines):
+                    if "---" in line or "Earnings Call Transcript" in line:
+                        # Start content after the separator
+                        start_idx = i + 1
+                        break
+                transcript_body = '\n'.join(lines[start_idx:])
+                
+                # Remove trailing metadata
+                if "---" in transcript_body:
+                    transcript_body = transcript_body.split("---")[0].strip()
+            
+            # Try to extract ticker, fiscal year, quarter from transcript content if not in state
+            if not ticker_symbol and transcript_content:
+                # Look for ticker in transcript
+                ticker_match = re.search(r'\*\*Company:\*\* ([A-Z]+)', transcript_content)
+                if ticker_match:
+                    ticker_symbol = ticker_match.group(1)
+            
+            if not requested_fiscal_year and transcript_content:
+                period_match = re.search(r'\*\*Period:\*\* FY(\d{4}) Q([1-4])', transcript_content)
+                if period_match:
+                    requested_fiscal_year = period_match.group(1)
+                    requested_quarter = period_match.group(2)
+            
+            # If we have all required information, store embeddings
+            if transcript_body and ticker_symbol and requested_fiscal_year and requested_quarter:
+                try:
+                    rag_service = get_rag_service()
+                    
+                    # Get company name (default to ticker if not available)
+                    company_name = state.get("company_name") or ticker_symbol
+                    
+                    # Store embeddings
+                    chunk_count = await rag_service.chunk_and_store_transcript(
+                        transcript_content=transcript_body,
+                        ticker_symbol=ticker_symbol,
+                        company_name=company_name,
+                        fiscal_year=requested_fiscal_year,
+                        quarter=requested_quarter,
+                        source_url=source_url or "",
+                    )
+                    logger.info(f"Stored {chunk_count} chunks with embeddings for {ticker_symbol} FY{requested_fiscal_year} Q{requested_quarter}")
+                except Exception as e:
+                    logger.error(f"Error storing embeddings: {e}", exc_info=True)
+                    # Continue even if embedding storage fails
+            else:
+                logger.warning(f"Cannot store embeddings: missing data. ticker={ticker_symbol}, year={requested_fiscal_year}, quarter={requested_quarter}, has_content={transcript_body is not None}")
+            
+            return {"current_stage": "storing_embeddings"}
+        except Exception as e:
+            logger.error(f"Error in store_embeddings node: {e}", exc_info=True)
+            # Return state to continue to summarizer even if embedding storage fails
+            return {"current_stage": "storing_embeddings", "error": str(e)}
+    
     def transcript_retriever(state: EarningsAgentState) -> Dict[str, Any]:
         """Retrieve the earnings transcript content."""
         
@@ -271,34 +367,106 @@ After calling get_earnings_transcript ONCE, stop. Do not make any more tool call
         }
     
     
-    def summarizer(state: EarningsAgentState) -> Dict[str, Any]:
-        """Generate comprehensive summary of the earnings report."""
+    async def summarizer(state: EarningsAgentState) -> Dict[str, Any]:
+        """Generate comprehensive summary of the earnings report using RAG when available."""
         
-        # Get all messages to find transcript content
+        settings = get_settings()
+        use_rag = getattr(settings, "rag_enabled", True)
+        
+        # Extract metadata
+        ticker_symbol = state.get("ticker_symbol")
+        requested_fiscal_year = state.get("requested_fiscal_year")
+        requested_quarter = state.get("requested_quarter")
+        
+        # Try to extract from messages if not in state
         messages_list = list(state["messages"])
-        
-        # Find transcript content in the messages
-        transcript_content = None
-        for msg in reversed(messages_list):
-            if hasattr(msg, 'content') and msg.content:
-                content_str = str(msg.content)
-                # Look for transcript indicators
-                if "Earnings Call Transcript" in content_str or "discountingcashflows.com" in content_str:
-                    # Make sure it's not just the header/template
-                    if len(content_str) > 1000 and not any(template in content_str.lower() for template in [
-                        'market is open', 'after-hours quote', 'last quote from'
-                    ]):
-                        transcript_content = content_str
-                        break
-        
-        if not transcript_content:
-            # Check if we have any substantial content
+        if not ticker_symbol or not requested_fiscal_year or not requested_quarter:
             for msg in reversed(messages_list):
                 if hasattr(msg, 'content') and msg.content:
                     content_str = str(msg.content)
-                    if len(content_str) > 500:
-                        transcript_content = content_str
+                    # Extract ticker
+                    if not ticker_symbol:
+                        ticker_match = re.search(r'\*\*Company:\*\* ([A-Z]+)', content_str)
+                        if ticker_match:
+                            ticker_symbol = ticker_match.group(1)
+                    # Extract fiscal period
+                    if not requested_fiscal_year or not requested_quarter:
+                        period_match = re.search(r'\*\*Period:\*\* FY(\d{4}) Q([1-4])', content_str)
+                        if period_match:
+                            requested_fiscal_year = period_match.group(1)
+                            requested_quarter = period_match.group(2)
+                    if ticker_symbol and requested_fiscal_year and requested_quarter:
                         break
+        
+        # Try to use RAG retrieval if enabled and we have the metadata
+        relevant_chunks = []
+        if use_rag and ticker_symbol and requested_fiscal_year and requested_quarter:
+            try:
+                rag_service = get_rag_service()
+                
+                # Check if transcript is already chunked
+                is_chunked = await rag_service.transcript_is_chunked(
+                    ticker_symbol=ticker_symbol,
+                    fiscal_year=requested_fiscal_year,
+                    quarter=requested_quarter,
+                )
+                
+                if is_chunked:
+                    # Use RAG: retrieve relevant chunks for comprehensive summary
+                    # Use a broad query to get chunks covering all major topics
+                    summary_query = "financial highlights revenue earnings per share EPS profitability margins free cash flow business segments performance metrics operational highlights management commentary strategic outlook guidance risks challenges announcements"
+                    
+                    relevant_chunks = await rag_service.retrieve_relevant_chunks(
+                        query=summary_query,
+                        ticker_symbol=ticker_symbol,
+                        fiscal_year=requested_fiscal_year,
+                        quarter=requested_quarter,
+                        top_k=rag_service.top_k,
+                    )
+                    logger.info(f"Retrieved {len(relevant_chunks)} relevant chunks for summarization using RAG")
+            except Exception as e:
+                logger.warning(f"RAG retrieval failed, falling back to full transcript: {e}", exc_info=True)
+                relevant_chunks = []
+        
+        # Build transcript content for summarization
+        if relevant_chunks:
+            # Use RAG chunks
+            transcript_content = "\n\n---\n\n".join([
+                f"[Chunk {chunk['chunk_index']}] {chunk['content']}"
+                for chunk in relevant_chunks
+            ])
+            logger.info(f"Using {len(relevant_chunks)} RAG chunks (total {len(transcript_content)} chars) for summarization")
+        else:
+            # Fallback: use full transcript from messages
+            transcript_content = None
+            for msg in reversed(messages_list):
+                if hasattr(msg, 'content') and msg.content:
+                    content_str = str(msg.content)
+                    # Look for transcript indicators
+                    if "Earnings Call Transcript" in content_str or "discountingcashflows.com" in content_str:
+                        if len(content_str) > 1000 and not any(template in content_str.lower() for template in [
+                            'market is open', 'after-hours quote', 'last quote from'
+                        ]):
+                            transcript_content = content_str
+                            # Remove metadata headers
+                            lines = content_str.split('\n')
+                            start_idx = 0
+                            for i, line in enumerate(lines):
+                                if "---" in line:
+                                    start_idx = i + 1
+                                    break
+                            if "---" in transcript_content:
+                                transcript_content = '\n'.join(transcript_content.split("---")[1:-1]).strip()
+                            break
+            
+            if not transcript_content:
+                # Check if we have any substantial content
+                for msg in reversed(messages_list):
+                    if hasattr(msg, 'content') and msg.content:
+                        content_str = str(msg.content)
+                        if len(content_str) > 500:
+                            transcript_content = content_str
+                            break
         
         system_prompt = """You are an expert financial analyst specializing in earnings call transcript analysis.
 
@@ -366,12 +534,22 @@ IMPORTANT: Look through the conversation history above to find the earnings call
 
 Make sure to highlight KEY POINTS with specific numbers, percentages, and important quotes from executives."""
         
-        # Include all messages (which contain the transcript from tool execution)
-        messages_list = list(state["messages"])
-        messages = [SystemMessage(content=system_prompt)] + messages_list
-        
-        # Add explicit instruction to summarize
-        messages.append(HumanMessage(content="Please analyze the earnings call transcript that was retrieved above and generate a comprehensive summary with all key points, financial highlights, and management commentary."))
+        # Prepare messages for summarization
+        if relevant_chunks:
+            # When using RAG, provide the chunks directly
+            messages = [
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=f"""Please analyze the following earnings call transcript chunks and generate a comprehensive summary. The transcript has been segmented into {len(relevant_chunks)} key sections:
+
+{transcript_content}
+
+Generate a comprehensive summary covering all the key sections above.""")
+            ]
+        else:
+            # Fallback: use full transcript from messages
+            messages_list = list(state["messages"])
+            messages = [SystemMessage(content=system_prompt)] + messages_list
+            messages.append(HumanMessage(content="Please analyze the earnings call transcript that was retrieved above and generate a comprehensive summary with all key points, financial highlights, and management commentary."))
         
         # Use regular LLM (not with tools) since we're just summarizing
         response = llm.invoke(messages)
@@ -398,6 +576,8 @@ Make sure to highlight KEY POINTS with specific numbers, percentages, and import
         if current_stage == "analyzing_query":
             return "transcript_retriever"
         elif current_stage == "retrieving_transcript":
+            return "store_embeddings"
+        elif current_stage == "storing_embeddings":
             return "summarizer"
         else:
             return "end"
@@ -409,30 +589,37 @@ Make sure to highlight KEY POINTS with specific numbers, percentages, and import
         # Check if we've already retrieved a transcript
         transcript_retrieved = state.get("transcript_retrieved", False)
         
-        # Check if any tool calls were for get_earnings_transcript
+        # Check messages for ToolMessage from get_earnings_transcript
+        # ToolMessage objects are created after tool execution
         messages = state.get("messages", [])
-        last_message = messages[-1] if messages else None
-        
-        # If we just retrieved a transcript, mark it and move to summarizer
-        if last_message and hasattr(last_message, "tool_calls"):
-            for tool_call in getattr(last_message, "tool_calls", []):
-                if tool_call.get("name") == "get_earnings_transcript":
+        for msg in reversed(messages):
+            if isinstance(msg, ToolMessage):
+                # ToolMessage has a 'name' attribute indicating which tool was called
+                tool_name = getattr(msg, 'name', None)
+                logger.debug(f"Found ToolMessage with name: {tool_name}")
+                if tool_name == "get_earnings_transcript":
                     transcript_retrieved = True
+                    logger.info("Detected transcript retrieval, routing to store_embeddings")
                     break
         
-        # If transcript was retrieved, go to summarizer
+        # If transcript was retrieved, go to store_embeddings first, then summarizer
         if transcript_retrieved:
-            return "summarizer"
+            return "store_embeddings"
         
         # Stay in current stage to process tool results
         if current_stage == "analyzing_query":
             return "query_analyzer"
         elif current_stage == "retrieving_transcript":
             # If we're in retrieving_transcript stage and haven't retrieved yet, stay here
-            # But if we've already retrieved, go to summarizer
-            return "summarizer" if transcript_retrieved else "transcript_retriever"
+            # But if we've already retrieved, go to store_embeddings
+            if transcript_retrieved:
+                return "store_embeddings"
+            else:
+                return "transcript_retriever"
         else:
-            return "summarizer"
+            # Default: go back to query_analyzer if we don't know what to do
+            logger.warning(f"Unknown current_stage: {current_stage}, routing to query_analyzer")
+            return "query_analyzer"
     
     # ==================== Build Graph ====================
     
@@ -441,6 +628,7 @@ Make sure to highlight KEY POINTS with specific numbers, percentages, and import
     # Add nodes
     workflow.add_node("query_analyzer", query_analyzer)
     workflow.add_node("transcript_retriever", transcript_retriever)
+    workflow.add_node("store_embeddings", store_embeddings)
     workflow.add_node("summarizer", summarizer)
     workflow.add_node("tools", tool_node)
     
@@ -474,9 +662,12 @@ Make sure to highlight KEY POINTS with specific numbers, percentages, and import
         {
             "query_analyzer": "query_analyzer",
             "transcript_retriever": "transcript_retriever",
-            "summarizer": "summarizer",
+            "store_embeddings": "store_embeddings",
         }
     )
+    
+    # Store embeddings goes to summarizer
+    workflow.add_edge("store_embeddings", "summarizer")
     
     # Summarizer goes to END
     workflow.add_edge("summarizer", END)
