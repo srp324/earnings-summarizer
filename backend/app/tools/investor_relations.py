@@ -798,55 +798,6 @@ class TranscriptTool(BaseTool):
                         
                         logger.info(f"API response received, HTML length: {len(api_response.text)}")
                         
-                        # Debug: Check if the transcript text exists and find its element
-                        search_text = "and I will be your conference operator today"
-                        logger.info(f"Searching for text: '{search_text}' in API response HTML")
-                        
-                        if search_text in api_response.text:
-                            logger.info(f"Text '{search_text}' FOUND in API response HTML")
-                            # Find the element containing this text
-                            all_elements = api_soup.find_all(string=lambda text: text and search_text in text)
-                            if all_elements:
-                                logger.info(f"Found {len(all_elements)} text node(s) containing the search text")
-                                for i, text_node in enumerate(all_elements):
-                                    # Get the parent element
-                                    parent = text_node.parent
-                                    if parent:
-                                        parent_tag = parent.name if hasattr(parent, 'name') else 'unknown'
-                                        parent_classes = parent.get('class', [])
-                                        class_str = ' '.join(parent_classes) if isinstance(parent_classes, list) else str(parent_classes)
-                                        parent_id = parent.get('id', '')
-                                        
-                                        logger.info(f"  Text node {i+1}:")
-                                        logger.info(f"    Parent tag: {parent_tag}")
-                                        logger.info(f"    Parent classes: '{class_str}'")
-                                        logger.info(f"    Parent id: '{parent_id}'")
-                                        logger.info(f"    Parent HTML preview: {str(parent)[:1000]}...")
-                                        
-                                        # Also check ancestors to see the full hierarchy
-                                        ancestors = []
-                                        current = parent
-                                        while current and hasattr(current, 'parent') and current.parent:
-                                            current = current.parent
-                                            if hasattr(current, 'name') and current.name:
-                                                ancestor_classes = current.get('class', [])
-                                                ancestor_class_str = ' '.join(ancestor_classes) if isinstance(ancestor_classes, list) else str(ancestor_classes)
-                                                ancestors.append(f"{current.name}.{ancestor_class_str}")
-                                        if ancestors:
-                                            logger.info(f"    Ancestor hierarchy: {' > '.join(ancestors)}")
-                            else:
-                                # Try finding by searching in element text
-                                matching_elements = [elem for elem in api_soup.find_all() 
-                                                   if elem.string and search_text in elem.string]
-                                if matching_elements:
-                                    logger.info(f"Found {len(matching_elements)} element(s) with matching text")
-                                    for i, elem in enumerate(matching_elements[:5]):
-                                        classes = elem.get('class', [])
-                                        class_str = ' '.join(classes) if isinstance(classes, list) else str(classes)
-                                        logger.info(f"  Element {i+1}: tag={elem.name}, classes='{class_str}', id='{elem.get('id', '')}'")
-                        else:
-                            logger.warning(f"Text '{search_text}' NOT FOUND in API response HTML")
-                        
                         # Check if the API response contains just a link (not actual content)
                         # If it's just a link, we'll need to use Playwright
                         links = api_soup.find_all('a')
@@ -909,8 +860,6 @@ class TranscriptTool(BaseTool):
                                 second_child = child_divs[1]
                                 child_classes = second_child.get('class', [])
                                 class_str = ' '.join(child_classes) if isinstance(child_classes, list) else str(child_classes)
-                                
-                                logger.info(f"  Second child div classes: '{class_str}'")
                                 
                                 if 'p-4' in class_str:
                                     text = second_child.get_text(separator=' ', strip=True)
@@ -1146,23 +1095,15 @@ class TranscriptTool(BaseTool):
                         child_divs = [child for child in flex_div.children 
                                      if hasattr(child, 'name') and child.name and child.name == 'div']
                         
-                        logger.info(f"Flex div {i+1}/{len(flex_my5_divs)}: has {len(child_divs)} direct child divs")
-                        
                         # Get the second child div (index 1) which should be the p-4 div
                         if len(child_divs) >= 2:
                             second_child = child_divs[1]
                             child_classes = second_child.get('class', [])
                             class_str = ' '.join(child_classes) if isinstance(child_classes, list) else str(child_classes)
                             
-                            logger.info(f"  Second child div classes: '{class_str}'")
-                            
                             if 'p-4' in class_str:
                                 text = second_child.get_text(separator=' ', strip=True)
                                 text_length = len(text.strip()) if text else 0
-                                
-                                # Log the FULL text from each p-4 div
-                                logger.info(f"  P-4 div {i+1}: length={text_length} chars")
-                                logger.info(f"  P-4 div {i+1} FIRST 200 CHARS: {text[:200]}...")
                                 
                                 if text and text_length > 20:
                                     transcript_parts.append(text.strip())
@@ -1235,7 +1176,6 @@ class TranscriptTool(BaseTool):
                     if transcript_parts:
                         transcript_content = '\n\n'.join(transcript_parts)
                         logger.info(f"Successfully extracted {len(transcript_content)} characters from {len(transcript_parts)} p-4 divs")
-                        logger.info(f"First 500 chars of combined content: {transcript_content[:500]}...")
                     else:
                         logger.warning("No p-4 divs found in flex.flex-col.my-5 elements")
                         # Log some debugging info
