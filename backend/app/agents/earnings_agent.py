@@ -145,11 +145,18 @@ def create_earnings_agent():
             else:
                 logger.warning(f"Could not extract both fiscal_year and quarter from query: {user_query}")
         
-        system_prompt = """You are an expert at understanding user queries about companies and stocks.
+        # Build system prompt based on whether year and quarter were extracted
+        has_year_and_quarter = requested_fiscal_year is not None and requested_quarter is not None
         
+        if has_year_and_quarter:
+            system_prompt = f"""You are an expert at understanding user queries about companies and stocks.
+
+The user query has been analyzed and BOTH fiscal year ({requested_fiscal_year}) AND quarter ({requested_quarter}) were found.
+
 Your task is to:
 1. Identify the ticker symbol from the user's query
-2. Use the list_earnings_transcripts tool with the ticker symbol to get available transcripts from discountingcashflows.com
+2. You MAY use list_earnings_transcripts to verify the transcript is available, but this is optional
+3. The transcript_retriever will handle fetching the specific transcript
 
 Common ticker symbols:
 - AAPL = Apple
@@ -157,7 +164,6 @@ Common ticker symbols:
 - GOOGL/GOOG = Google/Alphabet
 - AMZN = Amazon
 - META = Meta (Facebook)
-- NVDA = NVIDIA
 - NVDA = NVIDIA
 - TSLA = Tesla
 - NFLX = Netflix
@@ -170,7 +176,40 @@ Common ticker symbols:
 - CSCO = Cisco
 
 If the user provides a company name instead of a ticker, convert it to the ticker symbol.
-Then immediately use list_earnings_transcripts to get the available earnings transcripts.
+You may optionally use list_earnings_transcripts, but it's not required since we already know the year and quarter.
+"""
+        else:
+            system_prompt = """You are an expert at understanding user queries about companies and stocks.
+
+IMPORTANT: The user query does NOT contain both a fiscal year AND quarter. The user only provided a ticker symbol or company name.
+
+Your task is to:
+1. Identify the ticker symbol from the user's query
+2. DO NOT use list_earnings_transcripts - skip it entirely
+3. The transcript_retriever will automatically fetch the MOST RECENT transcript
+
+CRITICAL: Since no year/quarter was specified, DO NOT call list_earnings_transcripts. 
+The transcript_retriever will handle getting the latest transcript automatically.
+
+Common ticker symbols:
+- AAPL = Apple
+- MSFT = Microsoft
+- GOOGL/GOOG = Google/Alphabet
+- AMZN = Amazon
+- META = Meta (Facebook)
+- NVDA = NVIDIA
+- TSLA = Tesla
+- NFLX = Netflix
+- AMD = AMD
+- INTC = Intel
+- CRM = Salesforce
+- ORCL = Oracle
+- ADBE = Adobe
+- IBM = IBM
+- CSCO = Cisco
+
+If the user provides a company name instead of a ticker, convert it to the ticker symbol.
+DO NOT use list_earnings_transcripts - proceed directly to the next step.
 """
         
         messages = [SystemMessage(content=system_prompt)] + list(state["messages"])
@@ -362,10 +401,11 @@ After calling get_earnings_transcript ONCE with fiscal_year="{requested_fiscal_y
         else:
             system_prompt = """You are an expert at retrieving earnings transcripts from discountingcashflows.com.
 
-CRITICAL RULES:
-1. Call get_earnings_transcript EXACTLY ONCE - do NOT call it multiple times
+CRITICAL RULES - READ CAREFULLY:
+1. Call get_earnings_transcript EXACTLY ONCE - NEVER call it multiple times
 2. When the user specifies a fiscal year and quarter, you MUST extract them correctly and use ONLY those values
 3. Do NOT fetch multiple transcripts - fetch ONLY the one the user requested
+4. IGNORE any transcript lists you may have seen - do NOT try to fetch multiple transcripts from a list
 
 Examples of user queries and how to extract:
 - "FY2025Q2" or "FY 2025 Q2" → fiscal_year: "2025", quarter: "2" → Call tool ONCE with these values
@@ -386,16 +426,29 @@ Once you have extracted the fiscal year and quarter from the user's query:
   - quarter: The quarter number as a string "1", "2", "3", or "4" - extract ONLY the number
 
 If the user does NOT specify a fiscal year and quarter:
-- Use the most recent transcript (first one in the list)
+- Call get_earnings_transcript with ONLY the symbol parameter
+- Omit fiscal_year and quarter parameters (or pass None)
+- The tool will automatically retrieve the MOST RECENT transcript available
 - Still call the tool EXACTLY ONCE
 
-DO NOT:
-- Call the tool multiple times
-- Fetch multiple transcripts
-- Iterate through quarters
-- Use different values than what the user specified
+CRITICAL: When the user only provides a ticker symbol (e.g., "NVDA", "Apple", "MSFT") without any year or quarter:
+- DO NOT look at any transcript lists you may have seen
+- DO NOT try to pick a specific quarter from a list
+- DO NOT call the tool multiple times for different quarters
+- Call: get_earnings_transcript(symbol="NVDA", fiscal_year=None, quarter=None) EXACTLY ONCE
+- OR call: get_earnings_transcript(symbol="NVDA") without fiscal_year and quarter parameters EXACTLY ONCE
+- The tool will automatically select the latest/most recent transcript (the most recent quarter of the most recent year)
+- After calling ONCE, STOP. Do not make any more tool calls.
 
-After calling get_earnings_transcript ONCE, stop. Do not make any more tool calls.
+ABSOLUTELY FORBIDDEN:
+- Calling the tool multiple times
+- Fetching multiple transcripts
+- Iterating through quarters
+- Using different values than what the user specified
+- Trying to guess or extract a fiscal year/quarter if the user didn't provide one
+- Looking at transcript lists and trying to fetch multiple transcripts from them
+
+After calling get_earnings_transcript EXACTLY ONCE, stop immediately. Do not make any more tool calls.
 """
         
         messages_list = list(state["messages"])
@@ -633,7 +686,22 @@ Generate a comprehensive summary covering all the key sections above.""")
         if current_stage == "analyzing_query":
             return "transcript_retriever"
         elif current_stage == "retrieving_transcript":
-            return "store_embeddings"
+            # Check if transcript was already retrieved
+            transcript_retrieved = False
+            for msg in reversed(messages):
+                if isinstance(msg, ToolMessage):
+                    tool_name = getattr(msg, 'name', None)
+                    if tool_name == "get_earnings_transcript":
+                        transcript_retrieved = True
+                        break
+            
+            if transcript_retrieved:
+                # Transcript was retrieved, go to store_embeddings
+                return "store_embeddings"
+            else:
+                # No transcript yet, but no tool calls either - go to summarizer as fallback
+                # (This shouldn't normally happen, but prevents errors)
+                return "summarizer"
         elif current_stage == "storing_embeddings":
             return "summarizer"
         else:
@@ -708,6 +776,7 @@ Generate a comprehensive summary covering all the key sections above.""")
         should_use_tools,
         {
             "tools": "tools",
+            "store_embeddings": "store_embeddings",
             "summarizer": "summarizer",
             "end": END
         }
