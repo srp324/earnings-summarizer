@@ -67,3 +67,32 @@ class SessionListResponse(BaseModel):
     sessions: List[Dict[str, Any]]
     total: int
 
+
+class ChatRequest(BaseModel):
+    """Request for conversational chat."""
+    message: str = Field(
+        ...,
+        description="User's message",
+        example="Tell me more about the business segments",
+        min_length=1,
+        max_length=1000
+    )
+    session_id: Optional[str] = Field(
+        None,
+        description="Session ID for conversation continuity"
+    )
+
+
+class ChatResponse(BaseModel):
+    """Response from chat endpoint."""
+    session_id: str = Field(..., description="Session identifier")
+    message: str = Field(..., description="AI response")
+    action_taken: str = Field(
+        ...,
+        description="Action: 'chat' or 'analysis_triggered'"
+    )
+    intent: str = Field(..., description="Classified intent")
+    analysis_result: Optional[EarningsResponse] = Field(
+        None,
+        description="Analysis result if new analysis was triggered"
+    )

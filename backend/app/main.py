@@ -13,6 +13,7 @@ import logging
 from app.config import get_settings
 from app.database import init_db
 from app.api.routes import router
+from app.session_manager import initialize_session_manager
 
 # Configure logging
 logging.basicConfig(
@@ -35,6 +36,13 @@ async def lifespan(app: FastAPI):
         logger.info("Database initialized successfully")
     except Exception as e:
         logger.warning(f"Database initialization skipped: {e}")
+    
+    # Initialize session manager
+    try:
+        await initialize_session_manager()
+        logger.info("Session manager initialized successfully")
+    except Exception as e:
+        logger.warning(f"Session manager initialization warning: {e}")
     
     yield
     

@@ -1,334 +1,1153 @@
-"""Tool for finding and navigating investor relations sites."""
+"""Tool for retrieving earnings transcripts by scraping discountingcashflows.com."""
 
 from langchain.tools import BaseTool
 from pydantic import BaseModel, Field
-from typing import Type, List, Dict, Optional, ClassVar
-from urllib.parse import urljoin, urlparse
+from typing import Type, List, Dict, Optional
+import logging
+import requests
 import httpx
 from bs4 import BeautifulSoup
+from urllib.parse import urljoin
+from datetime import datetime
 import re
-import logging
 
 logger = logging.getLogger(__name__)
 
-
-class FindIRSiteInput(BaseModel):
-    """Input schema for finding investor relations site."""
-    company_name: str = Field(description="Company name or ticker symbol to find IR site for")
+# Base URL for discounting cash flows transcripts
+DCF_BASE_URL = "https://discountingcashflows.com"
 
 
-class InvestorRelationsTool(BaseTool):
-    """Tool for intelligently finding investor relations sites."""
+class TranscriptListInput(BaseModel):
+    """Input schema for listing earnings transcripts."""
+    symbol: str = Field(description="Stock ticker symbol (e.g., 'AAPL', 'MSFT', 'NVDA')")
+
+
+class TranscriptListTool(BaseTool):
+    """Tool for retrieving list of available earnings transcripts by scraping discountingcashflows.com."""
     
-    name: str = "find_investor_relations"
+    name: str = "list_earnings_transcripts"
     description: str = """
-    Find the investor relations website for a given company.
-    This tool searches for and validates the official investor relations page.
-    Input should be a company name (e.g., "Apple") or ticker symbol (e.g., "AAPL").
+    Get a list of available earnings call transcripts for a stock symbol by scraping discountingcashflows.com.
+    Input should be a stock ticker symbol (e.g., "AAPL" for Apple, "NVDA" for NVIDIA, "MSFT" for Microsoft).
+    Returns a list of available transcripts with their fiscal years, quarters, and dates.
+    Use the fiscal year, quarter, and date with get_earnings_transcript to retrieve the full transcript.
     """
-    args_schema: Type[BaseModel] = FindIRSiteInput
+    args_schema: Type[BaseModel] = TranscriptListInput
     
-    # Common IR URL patterns
-    IR_PATTERNS: ClassVar[List[str]] = [
-        "investor.{domain}",
-        "investors.{domain}",
-        "ir.{domain}",
-        "{domain}/investor-relations",
-        "{domain}/investors",
-        "{domain}/ir",
-    ]
-    
-    # Known IR URLs for major companies (fallback)
-    KNOWN_IR_URLS: ClassVar[Dict[str, str]] = {
-        # Tech companies
-        "AAPL": "https://investor.apple.com",
-        "APPLE": "https://investor.apple.com",
-        "MSFT": "https://www.microsoft.com/en-us/investor",
-        "MICROSOFT": "https://www.microsoft.com/en-us/investor",
-        "GOOGL": "https://abc.xyz/investor/",
-        "GOOG": "https://abc.xyz/investor/",
-        "GOOGLE": "https://abc.xyz/investor/",
-        "ALPHABET": "https://abc.xyz/investor/",
-        "AMZN": "https://ir.aboutamazon.com",
-        "AMAZON": "https://ir.aboutamazon.com",
-        "META": "https://investor.fb.com",
-        "FACEBOOK": "https://investor.fb.com",
-        "NVDA": "https://investor.nvidia.com",
-        "NVIDIA": "https://investor.nvidia.com",
-        "TSLA": "https://ir.tesla.com",
-        "TESLA": "https://ir.tesla.com",
-        "NFLX": "https://ir.netflix.net",
-        "NETFLIX": "https://ir.netflix.net",
-        "AMD": "https://ir.amd.com",
-        "INTC": "https://www.intc.com/investor-relations",
-        "INTEL": "https://www.intc.com/investor-relations",
-        "ORCL": "https://investor.oracle.com",
-        "ORACLE": "https://investor.oracle.com",
-        "CRM": "https://investor.salesforce.com",
-        "SALESFORCE": "https://investor.salesforce.com",
-        "ADBE": "https://www.adobe.com/investor-relations.html",
-        "ADOBE": "https://www.adobe.com/investor-relations.html",
-        # Other major companies
-        "WMT": "https://stock.walmart.com",
-        "WALMART": "https://stock.walmart.com",
-        "JPM": "https://www.jpmorganchase.com/ir",
-        "BAC": "https://investor.bankofamerica.com",
-        "V": "https://investor.visa.com",
-        "VISA": "https://investor.visa.com",
-        "MA": "https://investor.mastercard.com",
-        "MASTERCARD": "https://investor.mastercard.com",
-        "JNJ": "https://www.investor.jnj.com",
-        "PG": "https://www.pginvestor.com",
-        "DIS": "https://www.thewaltdisneycompany.com/investors/",
-        "DISNEY": "https://www.thewaltdisneycompany.com/investors/",
-        "KO": "https://investors.coca-colacompany.com",
-    }
-    
-    def _run(self, company_name: str) -> str:
-        """Find investor relations site."""
-        company_upper = company_name.upper().strip()
-        
-        # First, check if we have a known IR URL for this company
-        if company_upper in self.KNOWN_IR_URLS:
-            known_url = self.KNOWN_IR_URLS[company_upper]
-            logger.info(f"Using known IR URL for {company_name}: {known_url}")
-            
-            # Verify the URL is accessible
-            try:
-                headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-                with httpx.Client(timeout=10.0, follow_redirects=True) as client:
-                    response = client.head(known_url, headers=headers)
-                    if response.status_code < 400:
-                        return f"""**Investor Relations Site Found for '{company_name}':**
-
-**Official IR Site:** {known_url}
-
-This is the official investor relations website where you can find:
-- Latest earnings reports (10-K, 10-Q)
-- Press releases and announcements
-- Financial statements
-- SEC filings
-- Earnings call transcripts
-
-You can use the extract_earnings_links tool to find specific documents on this site."""
-            except Exception as e:
-                logger.warning(f"Known URL {known_url} not accessible: {e}")
-                # Continue to search fallback
-        
-        # Fallback to web search
+    def _run(self, symbol: str) -> str:
+        """List available earnings transcripts for a symbol."""
         try:
-            from ddgs import DDGS
+            symbol_upper = symbol.upper().strip()
+            logger.info(f"Fetching earnings transcripts list for {symbol_upper} from discountingcashflows.com")
             
-            logger.info(f"Searching for IR site for {company_name}")
+            # Construct URL for the transcripts page
+            url = f"{DCF_BASE_URL}/company/{symbol_upper}/transcripts/"
             
-            # Search for investor relations page
-            search_queries = [
-                f"{company_name} investor relations",
-                f"{company_name} IR earnings reports",
-                f"{company_name} SEC filings quarterly earnings",
-            ]
-            
-            all_results = []
-            try:
-                with DDGS() as ddgs:
-                    for query in search_queries:
-                        try:
-                            results = list(ddgs.text(query, max_results=5))
-                            all_results.extend(results)
-                        except Exception as search_err:
-                            logger.warning(f"Search query '{query}' failed: {search_err}")
-                            continue
-            except Exception as ddgs_err:
-                logger.error(f"DuckDuckGo search failed: {ddgs_err}")
-                return f"Unable to search for investor relations page for {company_name}. The search service is temporarily unavailable. You can try providing the direct investor relations URL if you know it."
-            
-            if not all_results:
-                return f"No investor relations page found for {company_name}. Please try providing the company's official investor relations URL directly."
-            
-            # Score and rank results
-            scored_results = []
-            ir_keywords = ['investor', 'ir', 'shareholders', 'earnings', 'financial', 'sec', 'annual-report']
-            
-            for result in all_results:
-                url = result.get('href', '')
-                title = result.get('title', '').lower()
-                body = result.get('body', '').lower()
-                
-                score = 0
-                
-                # Higher score for investor-related URLs
-                url_lower = url.lower()
-                for keyword in ir_keywords:
-                    if keyword in url_lower:
-                        score += 3
-                    if keyword in title:
-                        score += 2
-                    if keyword in body:
-                        score += 1
-                
-                # Bonus for official domains (not aggregator sites)
-                if not any(agg in url_lower for agg in ['yahoo', 'google', 'marketwatch', 'bloomberg', 'reuters', 'wikipedia']):
-                    score += 5
-                
-                # Bonus for .com domains (often official)
-                if '.com/' in url_lower or url_lower.endswith('.com'):
-                    score += 1
-                
-                scored_results.append({
-                    'url': url,
-                    'title': result.get('title', ''),
-                    'body': result.get('body', ''),
-                    'score': score
-                })
-            
-            # Sort by score
-            scored_results.sort(key=lambda x: x['score'], reverse=True)
-            
-            # Deduplicate by domain
-            seen_domains = set()
-            unique_results = []
-            for result in scored_results:
-                domain = urlparse(result['url']).netloc
-                if domain not in seen_domains:
-                    seen_domains.add(domain)
-                    unique_results.append(result)
-            
-            # Format output
-            output = f"**Investor Relations Sites Found for '{company_name}':**\n\n"
-            
-            for i, result in enumerate(unique_results[:5], 1):
-                output += f"{i}. **{result['title']}**\n"
-                output += f"   URL: {result['url']}\n"
-                output += f"   {result['body'][:200]}...\n"
-                output += f"   Relevance Score: {result['score']}\n\n"
-            
-            if unique_results:
-                best = unique_results[0]
-                output += f"\n**Recommended IR Site:** {best['url']}"
-            
-            return output
-            
-        except Exception as e:
-            return f"Error finding investor relations site: {str(e)}"
-    
-    async def _arun(self, company_name: str) -> str:
-        """Async execution."""
-        return self._run(company_name)
-
-
-class ExtractEarningsLinksInput(BaseModel):
-    """Input schema for extracting earnings links."""
-    ir_url: str = Field(description="URL of the investor relations page to extract earnings links from")
-
-
-class ExtractEarningsLinksTool(BaseTool):
-    """Tool for extracting earnings report links from an IR page."""
-    
-    name: str = "extract_earnings_links"
-    description: str = """
-    Extract links to earnings reports, 10-K, 10-Q filings, and other financial documents
-    from an investor relations page. Use this after finding the IR site.
-    """
-    args_schema: Type[BaseModel] = ExtractEarningsLinksInput
-    
-    EARNINGS_KEYWORDS: ClassVar[List[str]] = [
-        'earnings', 'quarterly', 'annual', '10-k', '10-q', '10k', '10q',
-        'financial results', 'fiscal', 'q1', 'q2', 'q3', 'q4',
-        'fy20', 'fy21', 'fy22', 'fy23', 'fy24',
-        'annual report', 'sec filing', 'press release',
-        'earnings call', 'transcript', 'presentation'
-    ]
-    
-    def _run(self, ir_url: str) -> str:
-        """Extract earnings-related links from IR page."""
-        try:
             headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
             }
             
-            with httpx.Client(timeout=30.0, follow_redirects=True) as client:
-                response = client.get(ir_url, headers=headers)
-                response.raise_for_status()
+            response = requests.get(url, headers=headers, timeout=30)
+            response.raise_for_status()
             
             soup = BeautifulSoup(response.text, 'html.parser')
             
-            earnings_links: List[Dict] = []
+            # Find all transcript links - looking for the structure from the website
+            # Transcripts are organized by fiscal year and quarter
+            transcripts = []
             
-            # Find all links
-            for link in soup.find_all('a', href=True):
-                href = link['href']
+            # Find all elements that might contain transcript information
+            # Looking for fiscal year headers and quarter links
+            transcript_sections = soup.find_all(['div', 'section'], class_=re.compile(r'transcript|quarter|fiscal', re.I))
+            
+            # Also look for links that contain quarter/year information
+            all_links = soup.find_all('a', href=True)
+            
+            # Pattern to match transcript links or sections
+            for link in all_links:
+                href = link.get('href', '')
                 text = link.get_text(strip=True)
                 
-                # Skip empty or javascript links
-                if not href or href.startswith('javascript:') or href == '#':
-                    continue
+                # Check if this looks like a transcript link
+                if 'transcript' in href.lower() or 'Q' in text or re.search(r'Q[1-4]', text) or re.search(r'FY \d{4}', text):
+                    # Extract fiscal year and quarter from text or href
+                    year_match = re.search(r'FY\s*(\d{4})', text, re.I)
+                    quarter_match = re.search(r'Q([1-4])', text, re.I)
+                    
+                    if year_match or quarter_match:
+                        year = year_match.group(1) if year_match else None
+                        quarter = quarter_match.group(1) if quarter_match else None
+                        
+                        # Try to extract date from nearby text
+                        date = None
+                        parent = link.parent
+                        if parent:
+                            parent_text = parent.get_text()
+                            date_match = re.search(r'(\w{3}\s+\d{1,2})', parent_text)
+                            if date_match:
+                                date = date_match.group(1)
+                        
+                        transcripts.append({
+                            'symbol': symbol_upper,
+                            'year': year,
+                            'quarter': quarter,
+                            'date': date,
+                            'text': text,
+                            'href': urljoin(url, href) if href else None
+                        })
+            
+            # If we didn't find links, try parsing the page structure directly
+            # Based on the website structure showing FY and Q sections
+            if not transcripts:
+                # Look for fiscal year sections
+                for section in soup.find_all(['div', 'section', 'ul', 'li']):
+                    section_text = section.get_text()
+                    year_match = re.search(r'FY\s*(\d{4})', section_text, re.I)
+                    
+                    if year_match:
+                        year = year_match.group(1)
+                        # Look for quarters in this section
+                        for item in section.find_all(['li', 'div', 'a']):
+                            item_text = item.get_text(strip=True)
+                            quarter_match = re.search(r'Q([1-4])', item_text, re.I)
+                            date_match = re.search(r'(\w{3}\s+\d{1,2})', item_text)
+                            
+                            if quarter_match:
+                                quarter = quarter_match.group(1)
+                                date = date_match.group(1) if date_match else None
+                                
+                                href = None
+                                link = item.find('a', href=True)
+                                if link:
+                                    href = urljoin(url, link['href'])
+                                
+                                transcripts.append({
+                                    'symbol': symbol_upper,
+                                    'year': year,
+                                    'quarter': quarter,
+                                    'date': date,
+                                    'text': item_text,
+                                    'href': href
+                                })
+            
+            # Remove duplicates
+            seen = set()
+            unique_transcripts = []
+            for t in transcripts:
+                key = (t.get('year'), t.get('quarter'))
+                if key not in seen and key != (None, None):
+                    seen.add(key)
+                    unique_transcripts.append(t)
+            
+            if not unique_transcripts:
+                return f"No earnings transcripts found for symbol '{symbol_upper}' on discountingcashflows.com. This could mean:\n1. The symbol is invalid\n2. The company doesn't have transcripts available\n3. The website structure may have changed\n\nYou can check manually at: {url}"
+            
+            # Sort by year and quarter (most recent first)
+            def sort_key(t):
+                year = int(t.get('year', 0)) if t.get('year') and t.get('year').isdigit() else 0
+                quarter = int(t.get('quarter', 0)) if t.get('quarter') else 0
+                return (year, quarter)
+            
+            unique_transcripts.sort(key=sort_key, reverse=True)
+            
+            # Format the output
+            output = f"**Earnings Call Transcripts Available for {symbol_upper}:**\n\n"
+            output += f"Found {len(unique_transcripts)} transcript(s) on discountingcashflows.com.\n\n"
+            
+            # Display transcripts (limit to 20 most recent)
+            for i, transcript in enumerate(unique_transcripts[:20], 1):
+                year = transcript.get('year', 'N/A')
+                quarter = transcript.get('quarter', 'N/A')
+                date = transcript.get('date', 'N/A')
+                href = transcript.get('href', '')
                 
-                # Make absolute URL
-                if not href.startswith('http'):
-                    href = urljoin(ir_url, href)
-                
-                # Check if earnings-related
-                combined = f"{href.lower()} {text.lower()}"
-                
-                relevance_score = 0
-                matched_keywords = []
-                
-                for keyword in self.EARNINGS_KEYWORDS:
-                    if keyword in combined:
-                        relevance_score += 1
-                        matched_keywords.append(keyword)
-                
-                # Bonus for PDF files
-                if '.pdf' in href.lower():
-                    relevance_score += 2
-                
-                if relevance_score > 0:
-                    earnings_links.append({
-                        'url': href,
-                        'text': text[:100] if text else 'No text',
-                        'score': relevance_score,
-                        'keywords': matched_keywords,
-                        'is_pdf': '.pdf' in href.lower()
-                    })
+                output += f"{i}. **FY {year} Q{quarter}**\n"
+                if date and date != 'N/A':
+                    output += f"   Date: {date}\n"
+                if href:
+                    output += f"   Link: {href}\n"
+                output += "\n"
             
-            # Sort by relevance
-            earnings_links.sort(key=lambda x: x['score'], reverse=True)
+            if len(unique_transcripts) > 20:
+                output += f"\n_(Showing 20 most recent out of {len(unique_transcripts)} total transcripts)_\n"
             
-            # Deduplicate by URL
-            seen_urls = set()
-            unique_links = []
-            for link in earnings_links:
-                if link['url'] not in seen_urls:
-                    seen_urls.add(link['url'])
-                    unique_links.append(link)
-            
-            if not unique_links:
-                return f"No earnings-related links found on {ir_url}. The page may use JavaScript to load content dynamically."
-            
-            # Format output
-            output = f"**Earnings-Related Documents Found on {ir_url}:**\n\n"
-            
-            # Group by type
-            pdfs = [l for l in unique_links if l['is_pdf']]
-            others = [l for l in unique_links if not l['is_pdf']]
-            
-            if pdfs:
-                output += "**PDF Documents:**\n"
-                for i, link in enumerate(pdfs[:15], 1):
-                    output += f"{i}. [{link['text']}]({link['url']})\n"
-                    output += f"   Keywords: {', '.join(link['keywords'][:5])}\n\n"
-            
-            if others:
-                output += "\n**Other Links:**\n"
-                for i, link in enumerate(others[:10], 1):
-                    output += f"{i}. [{link['text']}]({link['url']})\n"
+            output += "\n**Next Step:** Use the `get_earnings_transcript` tool with the symbol, fiscal year, and quarter to retrieve the full transcript content."
             
             return output
             
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error fetching transcripts list: {str(e)}")
+            return f"**Network Error**\n\nFailed to fetch transcripts from discountingcashflows.com: {str(e)}\n\nPlease check your internet connection and try again."
+            
         except Exception as e:
-            return f"Error extracting earnings links: {str(e)}"
+            logger.error(f"Error parsing transcripts list: {str(e)}")
+            return f"**Error retrieving earnings transcripts**\n\n{str(e)}\n\nPlease ensure:\n1. The ticker symbol is valid (e.g., 'NVDA' not 'NVIDIA')\n2. The website is accessible\n3. The website structure hasn't changed significantly"
     
-    async def _arun(self, ir_url: str) -> str:
+    async def _arun(self, symbol: str) -> str:
         """Async execution."""
-        return self._run(ir_url)
+        return self._run(symbol)
 
+
+class TranscriptInput(BaseModel):
+    """Input schema for retrieving a specific earnings transcript."""
+    symbol: str = Field(description="Stock ticker symbol (e.g., 'AAPL')")
+    fiscal_year: str = Field(description="Fiscal year (e.g., '2025' or '2024')")
+    quarter: str = Field(description="Quarter number (1, 2, 3, or 4)")
+
+
+class TranscriptTool(BaseTool):
+    """Tool for retrieving the full content of an earnings transcript by scraping discountingcashflows.com."""
+    
+    name: str = "get_earnings_transcript"
+    description: str = """
+    Retrieve the full content of an earnings call transcript using symbol, fiscal year, and quarter.
+    First use list_earnings_transcripts to get available transcripts with their fiscal years and quarters.
+    Input should be:
+    - symbol: Stock ticker (e.g., "NVDA")
+    - fiscal_year: Fiscal year as string (e.g., "2025")
+    - quarter: Quarter number as string "1", "2", "3", or "4"
+    Returns the complete earnings call transcript with all speakers and content.
+    """
+    args_schema: Type[BaseModel] = TranscriptInput
+    
+    def _run(self, symbol: str, fiscal_year: str, quarter: str) -> str:
+        """Retrieve full earnings transcript content."""
+        try:
+            symbol_upper = symbol.upper().strip()
+            logger.info(f"Fetching earnings transcript for {symbol_upper} FY{fiscal_year} Q{quarter} from discountingcashflows.com")
+            
+            # First, try to get the transcripts list page to find the specific transcript link
+            list_url = f"{DCF_BASE_URL}/company/{symbol_upper}/transcripts/"
+            
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+            }
+            
+            response = requests.get(list_url, headers=headers, timeout=30)
+            response.raise_for_status()
+            
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # Find the link for the specific transcript
+            transcript_url = None
+            
+            # Normalize the search terms
+            fiscal_year_normalized = fiscal_year.strip()
+            quarter_normalized = quarter.strip()
+            
+            # Look for links matching the fiscal year and quarter
+            # Try multiple matching strategies
+            for link in soup.find_all('a', href=True):
+                href = link.get('href', '')
+                text = link.get_text(strip=True)
+                link_html = str(link)
+                
+                # Strategy 1: Match both year and quarter in text
+                year_patterns = [
+                    rf'FY\s*{fiscal_year_normalized}',
+                    rf'Fiscal\s+Year\s+{fiscal_year_normalized}',
+                    fiscal_year_normalized
+                ]
+                quarter_patterns = [
+                    rf'Q{quarter_normalized}\b',
+                    rf'Quarter\s+{quarter_normalized}',
+                    quarter_normalized
+                ]
+                
+                year_match = any(re.search(pattern, text, re.I) or pattern in text for pattern in year_patterns)
+                quarter_match = any(re.search(pattern, text, re.I) or pattern in text for pattern in quarter_patterns)
+                
+                # Also check the href itself
+                if not year_match or not quarter_match:
+                    year_match = year_match or any(pattern in href.upper() for pattern in [f'FY{fiscal_year_normalized}', fiscal_year_normalized])
+                    quarter_match = quarter_match or f'Q{quarter_normalized}' in href.upper() or quarter_normalized in href.upper()
+                
+                # Check parent or sibling elements for context
+                if not year_match or not quarter_match:
+                    parent = link.parent
+                    if parent:
+                        parent_text = parent.get_text()
+                        year_match = year_match or any(re.search(pattern, parent_text, re.I) for pattern in year_patterns)
+                        quarter_match = quarter_match or any(re.search(pattern, parent_text, re.I) for pattern in quarter_patterns)
+                
+                if year_match and quarter_match:
+                    # Build full URL
+                    if href.startswith('http'):
+                        transcript_url = href
+                    elif href.startswith('/'):
+                        transcript_url = f"{DCF_BASE_URL}{href}"
+                    else:
+                        transcript_url = urljoin(list_url, href)
+                    logger.info(f"Found transcript URL: {transcript_url}")
+                    break
+            
+            # If we couldn't find a specific link, try constructing a URL pattern
+            # This is a fallback in case the page structure is different
+            if not transcript_url:
+                # The website might use a specific URL pattern - we'll try a few common ones
+                possible_patterns = [
+                    f"{DCF_BASE_URL}/company/{symbol_upper}/transcripts/{fiscal_year}/q{quarter}",
+                    f"{DCF_BASE_URL}/company/{symbol_upper}/transcripts/fy{fiscal_year}q{quarter}",
+                    f"{DCF_BASE_URL}/company/{symbol_upper}/transcript/{fiscal_year}/{quarter}",
+                ]
+                
+                for pattern_url in possible_patterns:
+                    try:
+                        test_response = requests.get(pattern_url, headers=headers, timeout=10)
+                        if test_response.status_code == 200:
+                            transcript_url = pattern_url
+                            break
+                    except Exception:
+                        continue
+            
+            if not transcript_url:
+                return f"**Transcript Not Found**\n\nCould not find a transcript link for {symbol_upper} FY{fiscal_year} Q{quarter}.\n\nPlease verify:\n1. The fiscal year and quarter are correct\n2. Use list_earnings_transcripts to see available transcripts\n3. Check manually at: {list_url}"
+            
+            # Fetch the transcript page
+            transcript_response = requests.get(transcript_url, headers=headers, timeout=30)
+            transcript_response.raise_for_status()
+            
+            # Check if the page is mostly empty (likely JavaScript-rendered)
+            if len(transcript_response.text) < 5000:
+                # If body is too small, this is likely a JS-rendered page
+                # Return early and let async _arun handle it with Playwright
+                logger.info(f"Page appears to be JavaScript-rendered (only {len(transcript_response.text)} bytes). Playwright will be used in async context.")
+                raise ValueError("Page requires JavaScript rendering")
+            
+            transcript_soup = BeautifulSoup(transcript_response.text, 'html.parser')
+            
+            # Extract transcript content
+            # Use multiple strategies to find the transcript content
+            transcript_content = ""
+            
+            # Strategy 1: Remove unwanted elements first
+            for element in transcript_soup(['script', 'style', 'nav', 'header', 'footer', 'aside', 'iframe', 'noscript']):
+                element.decompose()
+            
+            # Also remove elements with common navigation/header classes and IDs
+            unwanted_patterns = [
+                r'menu|navigation|nav',
+                r'header',
+                r'footer',
+                r'sidebar',
+                r'cookie|consent',
+                r'social|share',
+                r'ad|advertisement',
+                r'market.*quote|quote.*market',  # Market quotes/widgets
+                r'after.*hours|after-hours',
+                r'stock.*price|price.*stock',
+            ]
+            
+            for pattern in unwanted_patterns:
+                # Remove by class
+                for elem in transcript_soup.find_all(class_=re.compile(pattern, re.I)):
+                    elem.decompose()
+                # Remove by id
+                for elem in transcript_soup.find_all(id=re.compile(pattern, re.I)):
+                    elem.decompose()
+            
+            # Strategy 2: Try to find content by common class/id patterns
+            content_selectors = [
+                # Try by class
+                transcript_soup.find('div', class_=re.compile(r'transcript', re.I)),
+                transcript_soup.find('div', class_=re.compile(r'content', re.I)),
+                transcript_soup.find('div', class_=re.compile(r'text', re.I)),
+                transcript_soup.find('section', class_=re.compile(r'transcript|content', re.I)),
+                transcript_soup.find('article', class_=re.compile(r'transcript|content', re.I)),
+                # Try by id
+                transcript_soup.find(id=re.compile(r'transcript|content|main|text', re.I)),
+                # Try common semantic elements
+                transcript_soup.find('main'),
+                transcript_soup.find('article'),
+            ]
+            
+            for element in content_selectors:
+                if element:
+                    text = element.get_text(separator='\n', strip=True)
+                    # Check if it has substantial content (more than just navigation/links)
+                    if len(text) > 500 and not re.match(r'^\s*(Home|About|Contact|Login|Sign Up)', text[:100], re.I):
+                        transcript_content = text
+                        break
+            
+            # Strategy 3: If still no content, find the largest text block
+            if not transcript_content or len(transcript_content) < 500:
+                # Find all divs and get the one with the most text
+                all_divs = transcript_soup.find_all(['div', 'section', 'article', 'main'])
+                largest_content = ""
+                largest_length = 0
+                
+                for div in all_divs:
+                    text = div.get_text(separator='\n', strip=True)
+                    # Skip if it looks like navigation/menu/header
+                    if len(text) > largest_length and len(text) > 500:
+                        # Check if it contains transcript-like content
+                        if any(word in text.lower() for word in ['operator', 'analyst', 'question', 'answer', 'call', 'earnings', 'quarter', 'revenue']):
+                            largest_content = text
+                            largest_length = len(text)
+                
+                if largest_content:
+                    transcript_content = largest_content
+            
+            # Strategy 4: Find content by looking for transcript-specific patterns
+            if not transcript_content or len(transcript_content) < 500:
+                # Look for elements that likely contain the actual transcript
+                # Transcripts often have speaker names, questions, answers
+                all_text_elements = transcript_soup.find_all(['p', 'div', 'span', 'li'])
+                transcript_sections = []
+                
+                for elem in all_text_elements:
+                    text = elem.get_text(strip=True)
+                    # Look for transcript indicators
+                    if text and len(text) > 20:
+                        # Check if it looks like transcript content
+                        # Transcripts have patterns like: "Operator:", "Analyst:", speaker names, Q&A
+                        if any(pattern in text for pattern in [
+                            'Operator', 'Analyst', 'Question', 'Answer', 
+                            'Good morning', 'Good afternoon', 'Thank you',
+                            'CEO', 'CFO', 'President', 'Revenue', 'EPS',
+                            'earnings', 'guidance', 'quarter'
+                        ]) or re.search(r'[A-Z][a-z]+\s+[A-Z][a-z]+:', text):  # Pattern like "John Smith:"
+                            # Check it's not navigation
+                            if not any(nav_word in text.lower() for nav_word in ['home', 'menu', 'login', 'sign up', 'market is']):
+                                transcript_sections.append(text)
+                
+                if transcript_sections:
+                    # Join and clean up
+                    transcript_content = '\n\n'.join(transcript_sections[:200])  # Limit to avoid too much text
+                    
+                    # Remove duplicate content
+                    lines = transcript_content.split('\n')
+                    seen = set()
+                    unique_lines = []
+                    for line in lines:
+                        line_stripped = line.strip()
+                        if line_stripped and line_stripped not in seen and len(line_stripped) > 10:
+                            seen.add(line_stripped)
+                            unique_lines.append(line)
+                    transcript_content = '\n'.join(unique_lines)
+            
+            # Strategy 5: Last resort - get body content but filter aggressively
+            if not transcript_content or len(transcript_content) < 500:
+                # Remove common non-content elements by class/id
+                for element in transcript_soup.find_all(['div', 'section'], class_=re.compile(r'menu|nav|sidebar|header|footer|ad|advertisement|social|share|cookie|quote|market', re.I)):
+                    element.decompose()
+                
+                # Also remove elements with IDs containing these words
+                for element in transcript_soup.find_all(['div', 'section'], id=re.compile(r'menu|nav|sidebar|header|footer|ad|quote|market', re.I)):
+                    element.decompose()
+                
+                body = transcript_soup.find('body')
+                if body:
+                    # Get all paragraph and text content, but filter out short/boilerplate text
+                    paragraphs = body.find_all(['p', 'div', 'section'])
+                    content_parts = []
+                    for p in paragraphs:
+                        text = p.get_text(strip=True)
+                        # Only include substantial paragraphs that don't look like navigation
+                        if (len(text) > 100 and 
+                            not any(nav in text.lower() for nav in ['market is open', 'after-hours', 'last quote', 'sign up', 'login']) and
+                            not re.match(r'^[A-Z\s\(\)\%]+$', text)):  # Not all caps (likely navigation)
+                            content_parts.append(text)
+                    
+                    if content_parts:
+                        transcript_content = '\n\n'.join(content_parts)
+            
+            # Final validation - make sure we have actual transcript content, not just page template
+            if transcript_content:
+                # Check if it looks like actual transcript content vs page template
+                transcript_lower = transcript_content.lower()
+                has_template_indicators = any(indicator in transcript_lower for indicator in [
+                    'market is open', 'after-hours quote', 'last quote from', 
+                    'market is closed', 'sign up', 'login', 'home', 'about', 'contact'
+                ])
+                
+                has_transcript_indicators = any(indicator in transcript_lower for indicator in [
+                    'operator', 'analyst', 'question', 'answer', 'good morning', 'good afternoon',
+                    'thank you', 'ceo', 'cfo', 'president', 'revenue', 'eps', 'earnings',
+                    'guidance', 'quarter', 'fiscal year'
+                ]) or re.search(r'[A-Z][a-z]+\s+[A-Z][a-z]+:', transcript_content)  # Speaker pattern
+                
+                # If it has more template indicators than transcript indicators, it's likely wrong
+                if has_template_indicators and not has_transcript_indicators:
+                    logger.warning("Extracted content appears to be page template, not transcript")
+                    transcript_content = ""  # Reset to try Playwright
+            
+            # Strategy 6: Playwright is handled in async context (_arun method)
+            # Skip here in sync context to avoid async/sync conflicts
+            
+            # Final validation - make sure we have actual transcript content, not just page template
+            if transcript_content:
+                transcript_lower = transcript_content.lower()
+                has_template_indicators = any(indicator in transcript_lower for indicator in [
+                    'market is open', 'after-hours quote', 'last quote from', 
+                    'market is closed', 'sign up', 'login', 'home', 'about', 'contact'
+                ])
+                
+                has_transcript_indicators = any(indicator in transcript_lower for indicator in [
+                    'operator', 'analyst', 'question', 'answer', 'good morning', 'good afternoon',
+                    'thank you', 'ceo', 'cfo', 'president', 'revenue', 'eps', 'earnings',
+                    'guidance', 'quarter', 'fiscal year'
+                ]) or re.search(r'[A-Z][a-z]+\s+[A-Z][a-z]+:', transcript_content)  # Speaker pattern
+                
+                # If it has template indicators but no transcript indicators, it's likely wrong
+                if has_template_indicators and not has_transcript_indicators:
+                    logger.warning("Extracted content appears to be page template, not transcript")
+                    transcript_content = ""
+            
+            # If we still don't have valid transcript content, return error
+            if not transcript_content or len(transcript_content) < 500:
+                page_title = transcript_soup.title.string if transcript_soup.title else 'No title'
+                body_length = len(transcript_soup.get_text()) if transcript_soup.body else 0
+                logger.warning(f"Could not extract transcript content. Page title: {page_title}, Body text length: {body_length}")
+                return f"**Transcript Content Not Found**\n\nRetrieved the transcript page for {symbol_upper} FY{fiscal_year} Q{quarter} but could not extract the transcript content.\n\n**URL:** {transcript_url}\n\n**Possible Issues:**\n1. The page structure may be different than expected\n2. Content may be loaded dynamically via JavaScript\n3. The transcript may be behind a paywall or require authentication\n4. The page may require cookies or session data\n\n**Troubleshooting:**\n1. Visit the URL manually to verify the transcript is accessible\n2. Check if the page requires JavaScript enabled\n3. Consider checking if authentication is required"
+            
+            # Format the output
+            output = "**Earnings Call Transcript:**\n\n"
+            output += f"**Company:** {symbol_upper}\n"
+            output += f"**Period:** FY{fiscal_year} Q{quarter}\n"
+            output += f"**Source:** discountingcashflows.com\n"
+            output += "\n---\n\n"
+            output += transcript_content
+            output += f"\n\n---\n\n_Transcript length: {len(transcript_content):,} characters_\n"
+            output += f"_Source URL: {transcript_url}_"
+            
+            return output
+            
+        except ValueError as e:
+            # This is expected for JavaScript-rendered pages
+            # The async _arun method will handle it with Playwright
+            raise e
+        
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error fetching transcript: {str(e)}")
+            return f"**Network Error**\n\nFailed to fetch transcript from discountingcashflows.com: {str(e)}\n\nPlease check your internet connection and try again."
+        
+        except Exception as e:
+            logger.error(f"Error parsing transcript: {str(e)}")
+            return f"**Error retrieving earnings transcript**\n\n{str(e)}\n\nPlease ensure the symbol, fiscal year, and quarter are correct."
+    
+    async def _arun(self, symbol: str, fiscal_year: str, quarter: str) -> str:
+        """Async execution with Playwright support for JavaScript-rendered pages."""
+        logger.info(f"=== _arun called for {symbol} FY{fiscal_year} Q{quarter} ===")
+        # Since discountingcashflows.com uses JavaScript rendering, use Playwright directly
+        logger.info(f"Using async Playwright to fetch transcript for {symbol.upper()} FY{fiscal_year} Q{quarter}")
+        
+        symbol_upper = symbol.upper().strip()
+        fiscal_year_clean = re.sub(r'[^\d]', '', fiscal_year)
+        quarter_clean = quarter.strip()
+        
+        # Build the URL - construct directly since we know the pattern
+        transcript_url = f"{DCF_BASE_URL}/company/{symbol_upper}/transcripts/{fiscal_year_clean}/{quarter_clean}/"
+        
+        # The HTMX API endpoint that returns the transcript HTML
+        htmx_api_url = f"{transcript_url}?org.htmx.cache-buster=transcriptsContent"
+        
+        try:
+            # Try direct API call first (faster and more reliable than Playwright)
+            logger.info(f"Attempting direct API call to: {htmx_api_url}")
+            try:
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    logger.info(f"Making HTTP GET request to HTMX API...")
+                    api_response = await client.get(htmx_api_url, headers={
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+                    })
+                    if api_response.status_code == 200:
+                        # Parse the HTML response from the API
+                        from bs4 import BeautifulSoup
+                        api_soup = BeautifulSoup(api_response.text, 'html.parser')
+                        
+                        logger.info(f"API response received, HTML length: {len(api_response.text)}")
+                        
+                        # Debug: Check if the transcript text exists and find its element
+                        search_text = "and I will be your conference operator today"
+                        logger.info(f"Searching for text: '{search_text}' in API response HTML")
+                        
+                        if search_text in api_response.text:
+                            logger.info(f"Text '{search_text}' FOUND in API response HTML")
+                            # Find the element containing this text
+                            all_elements = api_soup.find_all(string=lambda text: text and search_text in text)
+                            if all_elements:
+                                logger.info(f"Found {len(all_elements)} text node(s) containing the search text")
+                                for i, text_node in enumerate(all_elements):
+                                    # Get the parent element
+                                    parent = text_node.parent
+                                    if parent:
+                                        parent_tag = parent.name if hasattr(parent, 'name') else 'unknown'
+                                        parent_classes = parent.get('class', [])
+                                        class_str = ' '.join(parent_classes) if isinstance(parent_classes, list) else str(parent_classes)
+                                        parent_id = parent.get('id', '')
+                                        
+                                        logger.info(f"  Text node {i+1}:")
+                                        logger.info(f"    Parent tag: {parent_tag}")
+                                        logger.info(f"    Parent classes: '{class_str}'")
+                                        logger.info(f"    Parent id: '{parent_id}'")
+                                        logger.info(f"    Parent HTML preview: {str(parent)[:1000]}...")
+                                        
+                                        # Also check ancestors to see the full hierarchy
+                                        ancestors = []
+                                        current = parent
+                                        while current and hasattr(current, 'parent') and current.parent:
+                                            current = current.parent
+                                            if hasattr(current, 'name') and current.name:
+                                                ancestor_classes = current.get('class', [])
+                                                ancestor_class_str = ' '.join(ancestor_classes) if isinstance(ancestor_classes, list) else str(ancestor_classes)
+                                                ancestors.append(f"{current.name}.{ancestor_class_str}")
+                                        if ancestors:
+                                            logger.info(f"    Ancestor hierarchy: {' > '.join(ancestors)}")
+                            else:
+                                # Try finding by searching in element text
+                                matching_elements = [elem for elem in api_soup.find_all() 
+                                                   if elem.string and search_text in elem.string]
+                                if matching_elements:
+                                    logger.info(f"Found {len(matching_elements)} element(s) with matching text")
+                                    for i, elem in enumerate(matching_elements[:5]):
+                                        classes = elem.get('class', [])
+                                        class_str = ' '.join(classes) if isinstance(classes, list) else str(classes)
+                                        logger.info(f"  Element {i+1}: tag={elem.name}, classes='{class_str}', id='{elem.get('id', '')}'")
+                        else:
+                            logger.warning(f"Text '{search_text}' NOT FOUND in API response HTML")
+                        
+                        # Check if the API response contains just a link (not actual content)
+                        # If it's just a link, we'll need to use Playwright
+                        links = api_soup.find_all('a')
+                        if len(links) == 1 and len(api_soup.find_all('div')) == 0:
+                            logger.info("HTMX API returned only a link, skipping direct API approach - will use full page navigation")
+                            raise Exception("HTMX API returned link only, need full page")
+                        
+                        # Find all div.flex.flex-col.my-5 elements, then get the second child div (which should be p-4)
+                        logger.info("Searching for div.flex.flex-col.my-5 elements in API response")
+                        
+                        # Try different ways to match classes - BeautifulSoup stores classes as a list
+                        def match_flex_my5_classes(class_attr):
+                            if not class_attr:
+                                return False
+                            # Handle both list and string formats
+                            if isinstance(class_attr, list):
+                                class_str = ' '.join(class_attr)
+                            else:
+                                class_str = str(class_attr)
+                            return 'flex' in class_str and 'flex-col' in class_str and 'my-5' in class_str
+                        
+                        # The API response should already be filtered to the specific transcript
+                        # But we can still look for a container to be safe
+                        api_main_container = api_soup.find(id='transcriptsContent')
+                        if not api_main_container:
+                            api_main_container = api_soup.find('main')
+                        
+                        all_flex_my5_divs = api_soup.find_all('div', class_=match_flex_my5_classes)
+                        logger.info(f"Found {len(all_flex_my5_divs)} div.flex.flex-col.my-5 elements in API response")
+                        
+                        # Filter to main container if it exists
+                        if api_main_container:
+                            flex_my5_divs = []
+                            for div in all_flex_my5_divs:
+                                parent = div.parent
+                                is_in_container = False
+                                while parent:
+                                    if parent == api_main_container:
+                                        is_in_container = True
+                                        break
+                                    if parent == api_soup or parent.name == '[document]':
+                                        break
+                                    parent = parent.parent
+                                if is_in_container:
+                                    flex_my5_divs.append(div)
+                            logger.info(f"After filtering to main container, {len(flex_my5_divs)} div.flex.flex-col.my-5 elements remain")
+                        else:
+                            flex_my5_divs = all_flex_my5_divs
+                        
+                        transcript_parts = []
+                        for i, flex_div in enumerate(flex_my5_divs):
+                            # Get all direct child divs (not recursive)
+                            child_divs = [child for child in flex_div.children 
+                                         if hasattr(child, 'name') and child.name and child.name == 'div']
+                            
+                            logger.info(f"Flex div {i+1}/{len(flex_my5_divs)}: has {len(child_divs)} direct child divs")
+                            
+                            # Get the second child div (index 1) which should be the p-4 div
+                            if len(child_divs) >= 2:
+                                second_child = child_divs[1]
+                                child_classes = second_child.get('class', [])
+                                class_str = ' '.join(child_classes) if isinstance(child_classes, list) else str(child_classes)
+                                
+                                logger.info(f"  Second child div classes: '{class_str}'")
+                                
+                                if 'p-4' in class_str:
+                                    text = second_child.get_text(separator=' ', strip=True)
+                                    text_length = len(text.strip()) if text else 0
+                                    
+                                    # Log preview instead of full text (can be very long)
+                                    logger.info(f"  P-4 div {i+1}: length={text_length} chars")
+                                    logger.info(f"  P-4 div {i+1} PREVIEW: {text[:200]}...")
+                                    
+                                    if text and text_length > 20:
+                                        transcript_parts.append(text.strip())
+                                        logger.info(f"  -> Added to transcript_parts (total parts: {len(transcript_parts)})")
+                                    else:
+                                        logger.warning(f"  -> Skipped (too short: {text_length} chars)")
+                                else:
+                                    logger.warning(f"  -> Second child div doesn't have p-4 class: '{class_str}'")
+                            else:
+                                logger.warning(f"  -> Flex div doesn't have 2 child divs, found {len(child_divs)}")
+                        
+                        # Filter to ensure we only get content from the correct fiscal year/quarter
+                        # Since the API URL is already specific to the year/quarter, all parts should be relevant
+                        # But we can add validation to ensure content matches
+                        if transcript_parts:
+                            logger.info(f"Extracted {len(transcript_parts)} transcript parts before filtering")
+                            # All parts should be from the correct transcript since URL is specific
+                            # But log a summary to help debug if wrong content appears
+                            for i, part in enumerate(transcript_parts[:3]):  # Log first 3 parts
+                                logger.info(f"  Part {i+1} preview: {part[:150]}...")
+                        
+                        if transcript_parts:
+                            transcript_content = '\n\n'.join(transcript_parts)
+                            logger.info(f"Successfully extracted {len(transcript_content)} characters from {len(transcript_parts)} p-4 divs")
+                            logger.info(f"First 500 chars of combined content: {transcript_content[:500]}...")
+                            
+                            if len(transcript_content) > 500:
+                                output = "**Earnings Call Transcript:**\n\n"
+                                output += f"**Company:** {symbol_upper}\n"
+                                output += f"**Period:** FY{fiscal_year_clean} Q{quarter_clean}\n"
+                                output += f"**Source:** discountingcashflows.com\n"
+                                output += "\n---\n\n"
+                                output += transcript_content
+                                output += f"\n\n---\n\n_Transcript length: {len(transcript_content):,} characters_\n"
+                                output += f"_Source URL: {transcript_url}_"
+                                logger.info(f"Returning transcript with {len(transcript_content)} characters")
+                                return output
+                            else:
+                                logger.warning(f"Extracted content too short: {len(transcript_content)} characters (minimum: 500)")
+                        else:
+                            logger.warning("No p-4 divs found in flex.flex-col.my-5 elements")
+                            # Log some debugging info
+                            all_divs = api_soup.find_all('div')
+                            logger.info(f"Total divs in API response: {len(all_divs)}")
+                            if all_divs:
+                                # Show classes of first few divs
+                                for i, div in enumerate(all_divs[:5]):
+                                    classes = div.get('class', [])
+                                    class_str = ' '.join(classes) if isinstance(classes, list) else str(classes)
+                                    logger.info(f"Div {i} classes: {class_str}")
+            except Exception as api_err:
+                err_msg = str(api_err)
+                if "HTMX API returned link only" in err_msg:
+                    logger.info("HTMX API returned link only, will use full page navigation with Playwright")
+                else:
+                    logger.warning(f"Direct HTMX API call failed: {err_msg}, falling back to Playwright")
+            
+            # Use Playwright to render the page (fallback if API call fails)
+            try:
+                from playwright.async_api import async_playwright
+                logger.info("Attempting to use Playwright async API to render JavaScript content...")
+                
+                async with async_playwright() as p:
+                    browser = await p.chromium.launch(headless=True)
+                    context = await browser.new_context(
+                        user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                    )
+                    page = await context.new_page()
+                    
+                    # Navigate to the full transcript page
+                    logger.info(f"Navigating to full transcript page: {transcript_url}")
+                    await page.goto(transcript_url, wait_until="domcontentloaded", timeout=30000)
+                    
+                    # Wait for the transcriptsContent element to appear
+                    try:
+                        await page.wait_for_selector('#transcriptsContent', timeout=15000)
+                        logger.info("Found transcriptsContent element after page load")
+                    except Exception:
+                        logger.warning("transcriptsContent element not found immediately")
+                    
+                    # Wait for HTMX to load the actual content (not just the link)
+                    # The content is loaded dynamically via HTMX after the page loads
+                    await page.wait_for_timeout(3000)
+                    
+                    # Wait for the transcriptsContent to have actual content (not just a link)
+                    try:
+                        await page.wait_for_function(
+                            '''
+                            () => {
+                                const elem = document.getElementById("transcriptsContent");
+                                if (!elem) return false;
+                                // Check if it has divs, not just links
+                                const divs = elem.querySelectorAll("div");
+                                const links = elem.querySelectorAll("a");
+                                return divs.length > 0 && divs.length > links.length;
+                            }
+                            ''',
+                            timeout=15000
+                        )
+                        logger.info("Confirmed transcriptsContent has div content (not just links)")
+                    except Exception as playwright_err:
+                        logger.warning("Timeout waiting for transcriptsContent to populate with divs")
+                    
+                    # Additional wait to ensure content is fully rendered
+                    await page.wait_for_timeout(2000)
+                    
+                    # Final wait for network to be idle
+                    await page.wait_for_load_state("networkidle", timeout=5000)
+                    
+                    # Get the rendered HTML
+                    rendered_html = await page.content()
+                    await browser.close()
+                    
+                    # Log the rendered HTML length
+                    logger.info(f"Rendered HTML length: {len(rendered_html)} characters")
+                    
+                    # Parse and extract content
+                    rendered_soup = BeautifulSoup(rendered_html, 'html.parser')
+                    
+                    # Debug: Check if the transcript text exists and find its element
+                    search_text = "and I will be your conference operator today"
+                    logger.info(f"Searching for text: '{search_text}' in rendered HTML")
+                    
+                    if search_text in rendered_html:
+                        logger.info(f"Text '{search_text}' FOUND in rendered HTML")
+                        # Find the element containing this text
+                        all_elements = rendered_soup.find_all(string=lambda text: text and search_text in text)
+                        if all_elements:
+                            logger.info(f"Found {len(all_elements)} text node(s) containing the search text")
+                            for i, text_node in enumerate(all_elements):
+                                # Get the parent element
+                                parent = text_node.parent
+                                if parent:
+                                    parent_tag = parent.name if hasattr(parent, 'name') else 'unknown'
+                                    parent_classes = parent.get('class', [])
+                                    class_str = ' '.join(parent_classes) if isinstance(parent_classes, list) else str(parent_classes)
+                                    parent_id = parent.get('id', '')
+                                    
+                                    logger.info(f"  Text node {i+1}:")
+                                    logger.info(f"    Parent tag: {parent_tag}")
+                                    logger.info(f"    Parent classes: '{class_str}'")
+                                    logger.info(f"    Parent id: '{parent_id}'")
+                                    logger.info(f"    Parent HTML preview: {str(parent)[:500]}...")
+                                    
+                                    # Also check ancestors to see the full hierarchy
+                                    ancestors = []
+                                    current = parent
+                                    while current and hasattr(current, 'parent') and current.parent:
+                                        current = current.parent
+                                        if hasattr(current, 'name') and current.name:
+                                            ancestor_classes = current.get('class', [])
+                                            ancestor_class_str = ' '.join(ancestor_classes) if isinstance(ancestor_classes, list) else str(ancestor_classes)
+                                            ancestors.append(f"{current.name}.{ancestor_class_str}")
+                                    if ancestors:
+                                        logger.info(f"    Ancestor hierarchy: {' > '.join(ancestors)}")
+                        else:
+                            # Try finding by searching in element text
+                            matching_elements = [elem for elem in rendered_soup.find_all() 
+                                               if elem.string and search_text in elem.string]
+                            if matching_elements:
+                                logger.info(f"Found {len(matching_elements)} element(s) with matching text")
+                                for i, elem in enumerate(matching_elements[:5]):
+                                    classes = elem.get('class', [])
+                                    class_str = ' '.join(classes) if isinstance(classes, list) else str(classes)
+                                    logger.info(f"  Element {i+1}: tag={elem.name}, classes='{class_str}', id='{elem.get('id', '')}'")
+                    else:
+                        logger.warning(f"Text '{search_text}' NOT FOUND in rendered HTML")
+                    
+                    # Extract transcript content BEFORE removing unwanted elements
+                    # This is critical because the cleanup process may remove parent elements
+                    def match_flex_my5_classes(class_attr):
+                        if not class_attr:
+                            return False
+                        if isinstance(class_attr, list):
+                            class_str = ' '.join(class_attr)
+                        else:
+                            class_str = str(class_attr)
+                        return 'flex' in class_str and 'flex-col' in class_str and 'my-5' in class_str
+                    
+                    # First, try to find the main transcript container to filter out sidebar/other transcripts
+                    main_transcript_container = None
+                    transcripts_content = rendered_soup.find(id='transcriptsContent')
+                    if transcripts_content:
+                        logger.info("Found transcriptsContent container, will extract only from within it")
+                        main_transcript_container = transcripts_content
+                    else:
+                        # Look for main content area (not sidebar)
+                        main_content = rendered_soup.find('main')
+                        if main_content:
+                            logger.info("Found main content area, will extract from it")
+                            main_transcript_container = main_content
+                        else:
+                            logger.info("No specific container found, will extract from all flex.flex-col.my-5 elements")
+                    
+                    # Find all div.flex.flex-col.my-5 elements BEFORE cleanup
+                    all_flex_my5_divs = rendered_soup.find_all('div', class_=match_flex_my5_classes)
+                    logger.info(f"Found {len(all_flex_my5_divs)} div.flex.flex-col.my-5 elements BEFORE removing unwanted elements")
+                    
+                    # Filter to only include elements within the main transcript container
+                    if main_transcript_container:
+                        flex_my5_divs = []
+                        for div in all_flex_my5_divs:
+                            # Check if this div is a descendant of the main container
+                            parent = div.parent
+                            is_in_container = False
+                            while parent:
+                                if parent == main_transcript_container:
+                                    is_in_container = True
+                                    break
+                                if parent == rendered_soup or parent.name == '[document]':
+                                    break
+                                parent = parent.parent
+                            if is_in_container:
+                                flex_my5_divs.append(div)
+                        logger.info(f"After filtering to main container, {len(flex_my5_divs)} div.flex.flex-col.my-5 elements remain")
+                    else:
+                        flex_my5_divs = all_flex_my5_divs
+                    
+                    transcript_content = ""
+                    transcript_parts = []
+                    
+                    # Extract content from all flex.flex-col.my-5 elements
+                    for i, flex_div in enumerate(flex_my5_divs):
+                        # Get all direct child divs (not recursive)
+                        child_divs = [child for child in flex_div.children 
+                                     if hasattr(child, 'name') and child.name and child.name == 'div']
+                        
+                        logger.info(f"Flex div {i+1}/{len(flex_my5_divs)}: has {len(child_divs)} direct child divs")
+                        
+                        # Get the second child div (index 1) which should be the p-4 div
+                        if len(child_divs) >= 2:
+                            second_child = child_divs[1]
+                            child_classes = second_child.get('class', [])
+                            class_str = ' '.join(child_classes) if isinstance(child_classes, list) else str(child_classes)
+                            
+                            logger.info(f"  Second child div classes: '{class_str}'")
+                            
+                            if 'p-4' in class_str:
+                                text = second_child.get_text(separator=' ', strip=True)
+                                text_length = len(text.strip()) if text else 0
+                                
+                                # Log the FULL text from each p-4 div
+                                logger.info(f"  P-4 div {i+1}: length={text_length} chars")
+                                logger.info(f"  P-4 div {i+1} FIRST 200 CHARS: {text[:200]}...")
+                                
+                                if text and text_length > 20:
+                                    transcript_parts.append(text.strip())
+                                    logger.info(f"  -> Added to transcript_parts (total parts: {len(transcript_parts)})")
+                                else:
+                                    logger.warning(f"  -> Skipped (too short: {text_length} chars)")
+                            else:
+                                logger.warning(f"  -> Second child div doesn't have p-4 class: '{class_str}'")
+                        else:
+                            logger.warning(f"  -> Flex div doesn't have 2 child divs, found {len(child_divs)}")
+                    
+                    # Filter transcript parts to only include content from the correct fiscal year/quarter
+                    # Check if the page contains multiple transcripts and filter accordingly
+                    if transcript_parts:
+                        # Look for fiscal year/quarter indicators in the page to filter correctly
+                        page_text = rendered_html.lower()
+                        target_year = fiscal_year_clean
+                        target_quarter = quarter_clean
+                        
+                        # Check if we're on the correct transcript page by looking at the URL or page content
+                        # The URL should already be correct, but verify the content matches
+                        filtered_parts = []
+                        for part in transcript_parts:
+                            part_lower = part.lower()
+                            # Include the part if it doesn't clearly belong to a different quarter
+                            # Look for indicators that suggest it's from the wrong quarter
+                            has_wrong_quarter = False
+                            
+                            # Check for other quarter mentions that might indicate wrong transcript
+                            # But be careful - transcripts often mention other quarters in context
+                            # Only filter if we see clear indicators of a different transcript section
+                            
+                            # For now, include all parts since we're already on the correct URL
+                            # The URL construction ensures we're on the right page
+                            filtered_parts.append(part)
+                        
+                        transcript_parts = filtered_parts
+                        logger.info(f"After filtering, {len(transcript_parts)} transcript parts remain")
+                    
+                    # Now remove unwanted elements (after extraction)
+                    for element in rendered_soup(['script', 'style', 'nav', 'header', 'footer', 'aside', 'iframe', 'noscript']):
+                        element.decompose()
+                    
+                    # Remove elements with navigation/template classes/ids (but be more careful)
+                    unwanted_patterns = [
+                        r'menu|navigation|nav', r'header', r'footer', r'sidebar',
+                        r'cookie|consent', r'social|share', r'ad|advertisement',
+                        r'market.*quote|quote.*market', r'after.*hours|after-hours',
+                        r'stock.*price|price.*stock', r'tab|tabs',
+                    ]
+                    for pattern in unwanted_patterns:
+                        for elem in rendered_soup.find_all(['div', 'section', 'aside'], class_=re.compile(pattern, re.I)):
+                            # Only remove if it doesn't contain transcript content
+                            elem_text = elem.get_text(strip=True)
+                            if not any(keyword in elem_text.lower() for keyword in [
+                                'conference operator', 'analyst', 'cfo', 'ceo', 'president',
+                                'thank you', 'good morning', 'good afternoon', 'quarter',
+                                'revenue', 'earnings', 'guidance'
+                            ]):
+                                elem.decompose()
+                        for elem in rendered_soup.find_all(['div', 'section', 'aside'], id=re.compile(pattern, re.I)):
+                            elem_text = elem.get_text(strip=True)
+                            if not any(keyword in elem_text.lower() for keyword in [
+                                'conference operator', 'analyst', 'cfo', 'ceo', 'president',
+                                'thank you', 'good morning', 'good afternoon', 'quarter',
+                                'revenue', 'earnings', 'guidance'
+                            ]):
+                                elem.decompose()
+                    
+                    if transcript_parts:
+                        transcript_content = '\n\n'.join(transcript_parts)
+                        logger.info(f"Successfully extracted {len(transcript_content)} characters from {len(transcript_parts)} p-4 divs")
+                        logger.info(f"First 500 chars of combined content: {transcript_content[:500]}...")
+                    else:
+                        logger.warning("No p-4 divs found in flex.flex-col.my-5 elements")
+                        # Log some debugging info
+                        all_divs = rendered_soup.find_all('div')
+                        logger.info(f"Total divs in rendered HTML: {len(all_divs)}")
+                        if all_divs:
+                            # Show classes of first few divs
+                            for i, div in enumerate(all_divs[:10]):
+                                classes = div.get('class', [])
+                                class_str = ' '.join(classes) if isinstance(classes, list) else str(classes)
+                                text_preview = div.get_text(separator=' ', strip=True)[:100] if div.get_text(strip=True) else ""
+                                logger.info(f"Div {i} classes: {class_str}, text_preview: {text_preview}...")
+                    
+                    # If we didn't find transcriptsContent div, use fallback strategies
+                    if not transcript_content:
+                        # Fallback: look for elements with transcript patterns
+                        all_elements = rendered_soup.find_all(['div', 'section', 'article', 'main', 'p', 'span'])
+                        transcript_parts = []
+                        
+                        for elem in all_elements:
+                            text = elem.get_text(separator=' ', strip=True)
+                            
+                            # Look for speaker patterns: "Name (Role)" or patterns with parentheses
+                            if re.search(r'\([^)]+\)', text) and len(text) > 50:
+                                # Check if it looks like a speaker line or contains transcript keywords
+                                if any(keyword in text.lower() for keyword in [
+                                    'conference operator', 'analyst', 'cfo', 'ceo', 'president',
+                                    'thank you', 'good morning', 'good afternoon', 'quarter',
+                                    'revenue', 'earnings', 'guidance', 'million', 'billion'
+                                ]) or re.search(r'[A-Z][a-z]+\s+\([^)]+\)', text):
+                                    # Skip if it's navigation/template
+                                    if not any(nav in text.lower() for nav in [
+                                        'market is open', 'after-hours', 'sign up', 'login',
+                                        'download pdf', 'ai insights'
+                                    ]):
+                                        transcript_parts.append(text)
+                        
+                        # If we didn't find speaker patterns, look for large text blocks in main content
+                        if not transcript_parts or sum(len(p) for p in transcript_parts) < 1000:
+                            body = rendered_soup.find('body')
+                            if body:
+                                main_content = body.find('main') or body.find('article')
+                                if not main_content:
+                                    all_divs = body.find_all('div', class_=lambda x: x and not any(
+                                        nav in str(x).lower() for nav in ['nav', 'sidebar', 'header', 'footer', 'menu']
+                                    ))
+                                    if all_divs:
+                                        main_content = max(all_divs, key=lambda d: len(d.get_text(strip=True)))
+                                
+                                if main_content:
+                                    main_text = main_content.get_text(separator='\n', strip=True)
+                                    lines = [line.strip() for line in main_text.split('\n') if line.strip()]
+                                    
+                                    for i, line in enumerate(lines):
+                                        if len(line) < 20:
+                                            continue
+                                        
+                                        if (re.search(r'\([^)]+\)', line) or
+                                            any(keyword in line.lower() for keyword in [
+                                                'conference operator', 'analyst', 'cfo', 'ceo',
+                                                'thank you', 'good morning', 'good afternoon'
+                                            ]) or
+                                            (len(line) > 100 and any(keyword in line.lower() for keyword in [
+                                                'revenue', 'earnings', 'quarter', 'million', 'billion'
+                                            ]))):
+                                            transcript_parts.append(line)
+                                            for j in range(i+1, min(i+10, len(lines))):
+                                                if len(lines[j]) > 50:
+                                                    transcript_parts.append(lines[j])
+                                                else:
+                                                    break
+                        
+                        # Combine transcript parts
+                        if transcript_parts:
+                            seen = set()
+                            unique_parts = []
+                            for part in transcript_parts:
+                                part_clean = part.strip()
+                                if part_clean and part_clean not in seen and len(part_clean) > 20:
+                                    seen.add(part_clean)
+                                    unique_parts.append(part_clean)
+                            
+                            transcript_content = '\n\n'.join(unique_parts)
+                    
+                    # Final validation (applies to both transcriptsContent div and fallback strategies)
+                    extraction_reasons = []
+                    
+                    if transcript_content:
+                        transcript_lower = transcript_content.lower()
+                        has_template = any(indicator in transcript_lower for indicator in [
+                            'market is open', 'after-hours quote', 'last quote from',
+                            'sign up', 'login', 'download pdf', 'ai insights'
+                        ])
+                        has_transcript = any(indicator in transcript_lower for indicator in [
+                            'conference operator', 'analyst', 'cfo', 'ceo',
+                            'question', 'answer', 'revenue', 'earnings', 'quarter'
+                        ]) or re.search(r'\([^)]+\)', transcript_content)
+                        
+                        # If we found p-4 divs, we can be confident it's transcript content
+                        if len(transcript_content) > 500:
+                            output = "**Earnings Call Transcript:**\n\n"
+                            output += f"**Company:** {symbol_upper}\n"
+                            output += f"**Period:** FY{fiscal_year_clean} Q{quarter_clean}\n"
+                            output += f"**Source:** discountingcashflows.com\n"
+                            output += "\n---\n\n"
+                            output += transcript_content
+                            output += f"\n\n---\n\n_Transcript length: {len(transcript_content):,} characters_\n"
+                            output += f"_Source URL: {transcript_url}_"
+                            return output
+                        elif has_transcript and not has_template and len(transcript_content) > 500:
+                            # For fallback strategies, use stricter validation
+                            output = "**Earnings Call Transcript:**\n\n"
+                            output += f"**Company:** {symbol_upper}\n"
+                            output += f"**Period:** FY{fiscal_year_clean} Q{quarter_clean}\n"
+                            output += f"**Source:** discountingcashflows.com\n"
+                            output += "\n---\n\n"
+                            output += transcript_content
+                            output += f"\n\n---\n\n_Transcript length: {len(transcript_content):,} characters_\n"
+                            output += f"_Source URL: {transcript_url}_"
+                            return output
+                        else:
+                            extraction_reasons.append(f"Content length too short: {len(transcript_content)} chars (minimum: 500)")
+                            if not has_transcript:
+                                extraction_reasons.append("Content doesn't contain transcript indicators")
+                            if has_template:
+                                extraction_reasons.append("Content contains template/navigation text")
+                            logger.warning(f"Extracted content failed validation. Reasons: {'; '.join(extraction_reasons)}")
+                    else:
+                        # No transcript_content was extracted - explain why
+                        extraction_reasons.append(f"No transcript content extracted")
+                        if len(flex_my5_divs) == 0:
+                            extraction_reasons.append("No div.flex.flex-col.my-5 elements found in rendered HTML")
+                        else:
+                            extraction_reasons.append(f"Found {len(flex_my5_divs)} flex.flex-col.my-5 divs but no p-4 divs extracted")
+                            extraction_reasons.append(f"transcript_parts count: {len(transcript_parts)}")
+                    
+                    if not transcript_content:
+                        reasons_str = '; '.join(extraction_reasons) if extraction_reasons else "Unknown reason"
+                        logger.warning(f"Could not extract transcript content from rendered page. Page length: {len(rendered_html)}. Reasons: {reasons_str}")
+            except ImportError:
+                logger.warning("Playwright not available, skipping JavaScript rendering")
+            except Exception as playwright_err:
+                logger.error(f"Playwright async rendering failed: {str(playwright_err)}")
+                import traceback
+                logger.error(traceback.format_exc())
+            
+        except Exception as e:
+            logger.error(f"Async transcript fetch failed: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+        
+        # If we got here, Playwright extraction failed
+        # Return a helpful error message
+        return f"**Transcript Content Not Found**\n\nCould not extract transcript content for {symbol.upper()} FY{fiscal_year} Q{quarter}.\n\nThe page appears to be JavaScript-rendered and Playwright was unable to extract the content.\n\n**URL:** {transcript_url if 'transcript_url' in locals() else 'N/A'}\n\n**Troubleshooting:**\n1. The page structure may have changed\n2. The transcript may require authentication\n3. Check the URL manually to verify accessibility"

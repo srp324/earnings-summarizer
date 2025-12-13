@@ -30,6 +30,8 @@ function App() {
   const [isLoading, setIsLoading] = useState(false)
   const [currentStages, setCurrentStages] = useState<AnalysisStage[]>(stages)
   const [showWelcome, setShowWelcome] = useState(true)
+  const [sessionId, setSessionId] = useState<string | null>(null)
+  const [isAnalyzing, setIsAnalyzing] = useState(false)
   const messagesEndRef = useRef<HTMLDivElement>(null)
 
   const scrollToBottom = () => {
@@ -62,50 +64,83 @@ function App() {
     }
 
     setMessages(prev => [...prev, userMessage])
+    const currentInput = input.trim()
     setInput('')
     setIsLoading(true)
     setShowWelcome(false)
-    resetStages()
-
-    // Simulate stage progression
-    const stageProgression = async () => {
-      updateStage('analyzing', 'active')
-      await new Promise(r => setTimeout(r, 1500))
-      updateStage('analyzing', 'complete')
-      
-      updateStage('searching', 'active')
-      await new Promise(r => setTimeout(r, 2000))
-      updateStage('searching', 'complete')
-      
-      updateStage('parsing', 'active')
-      await new Promise(r => setTimeout(r, 3000))
-      updateStage('parsing', 'complete')
-      
-      updateStage('summarizing', 'active')
-    }
-
-    stageProgression()
 
     try {
-      const response = await fetch('/api/v1/analyze', {
+      // Use the new chat endpoint that handles routing
+      const response = await fetch('/api/v1/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ company_query: input.trim() }),
+        body: JSON.stringify({ 
+          message: currentInput,
+          session_id: sessionId 
+        }),
       })
+
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`)
+      }
 
       const data = await response.json()
       
-      updateStage('summarizing', 'complete')
+      // Store session ID for conversation continuity
+      if (data.session_id) {
+        setSessionId(data.session_id)
+      }
 
+      // Check if this triggered an analysis
+      if (data.action_taken === 'analysis_triggered') {
+        // Show stages for analysis
+        setIsAnalyzing(true)
+        resetStages()
+        
+        // Simulate stage progression for UI feedback
+        const stageProgression = async () => {
+          updateStage('analyzing', 'active')
+          await new Promise(r => setTimeout(r, 800))
+          updateStage('analyzing', 'complete')
+          
+          updateStage('searching', 'active')
+          await new Promise(r => setTimeout(r, 1200))
+          updateStage('searching', 'complete')
+          
+          updateStage('parsing', 'active')
+          await new Promise(r => setTimeout(r, 1500))
+          updateStage('parsing', 'complete')
+          
+          updateStage('summarizing', 'active')
+          await new Promise(r => setTimeout(r, 500))
+          updateStage('summarizing', 'complete')
+        }
+
+        await stageProgression()
+        setIsAnalyzing(false)
+      }
+
+      // If this was an analysis, check for summary in analysis_result
+      let assistantContent = data.message || data.error || 'Unable to generate response. Please try again.'
+      
+      if (data.action_taken === 'analysis_triggered' && data.analysis_result) {
+        // Prefer summary from analysis_result, fallback to message
+        assistantContent = data.analysis_result.summary || data.analysis_result.message || assistantContent
+        
+        // If we have messages in analysis_result, we could add them too
+        // But for now, just use the summary
+      }
+      
       const assistantMessage: Message = {
         id: (Date.now() + 1).toString(),
         role: 'assistant',
-        content: data.summary || data.error || 'Unable to generate summary. Please try again.',
+        content: assistantContent,
         timestamp: new Date(),
       }
 
       setMessages(prev => [...prev, assistantMessage])
     } catch (error) {
+      console.error('Chat error:', error)
       const errorMessage: Message = {
         id: (Date.now() + 1).toString(),
         role: 'assistant',
@@ -114,10 +149,13 @@ function App() {
       }
       setMessages(prev => [...prev, errorMessage])
       
-      // Update stages to show error
-      setCurrentStages(prev => prev.map(s => 
-        s.status === 'active' ? { ...s, status: 'error' as const } : s
-      ))
+      // Update stages to show error if we were analyzing
+      if (isAnalyzing) {
+        setCurrentStages(prev => prev.map(s => 
+          s.status === 'active' ? { ...s, status: 'error' as const } : s
+        ))
+        setIsAnalyzing(false)
+      }
     } finally {
       setIsLoading(false)
     }
@@ -229,46 +267,56 @@ function App() {
                   className="flex justify-start"
                 >
                   <div className="bg-slate-800/80 rounded-2xl px-5 py-4 max-w-md">
-                    {/* Stage indicators */}
-                    <div className="space-y-3 mb-4">
-                      {currentStages.map((stage, index) => (
-                        <motion.div
-                          key={stage.id}
-                          initial={{ opacity: 0, x: -10 }}
-                          animate={{ opacity: 1, x: 0 }}
-                          transition={{ delay: index * 0.1 }}
-                          className={`flex items-center gap-3 ${
-                            stage.status === 'active' ? 'text-ocean-400' :
-                            stage.status === 'complete' ? 'text-emerald-400' :
-                            stage.status === 'error' ? 'text-coral-500' :
-                            'text-slate-500'
-                          }`}
-                        >
-                          <div className="relative">
-                            {stage.status === 'active' ? (
-                              <Loader2 className="w-4 h-4 animate-spin" />
-                            ) : stage.status === 'complete' ? (
-                              <CheckCircle className="w-4 h-4" />
-                            ) : stage.status === 'error' ? (
-                              <AlertCircle className="w-4 h-4" />
-                            ) : (
-                              stage.icon
-                            )}
-                          </div>
-                          <span className="text-sm font-medium">{stage.label}</span>
-                          {stage.status === 'active' && (
-                            <div className="flex gap-1 ml-auto">
-                              <span className="typing-dot w-1.5 h-1.5 bg-ocean-400 rounded-full" />
-                              <span className="typing-dot w-1.5 h-1.5 bg-ocean-400 rounded-full" />
-                              <span className="typing-dot w-1.5 h-1.5 bg-ocean-400 rounded-full" />
-                            </div>
-                          )}
-                        </motion.div>
-                      ))}
-                    </div>
-                    <p className="text-slate-400 text-sm">
-                      Analyzing earnings reports...
-                    </p>
+                    {isAnalyzing ? (
+                      <>
+                        {/* Stage indicators for analysis */}
+                        <div className="space-y-3 mb-4">
+                          {currentStages.map((stage, index) => (
+                            <motion.div
+                              key={stage.id}
+                              initial={{ opacity: 0, x: -10 }}
+                              animate={{ opacity: 1, x: 0 }}
+                              transition={{ delay: index * 0.1 }}
+                              className={`flex items-center gap-3 ${
+                                stage.status === 'active' ? 'text-ocean-400' :
+                                stage.status === 'complete' ? 'text-emerald-400' :
+                                stage.status === 'error' ? 'text-coral-500' :
+                                'text-slate-500'
+                              }`}
+                            >
+                              <div className="relative">
+                                {stage.status === 'active' ? (
+                                  <Loader2 className="w-4 h-4 animate-spin" />
+                                ) : stage.status === 'complete' ? (
+                                  <CheckCircle className="w-4 h-4" />
+                                ) : stage.status === 'error' ? (
+                                  <AlertCircle className="w-4 h-4" />
+                                ) : (
+                                  stage.icon
+                                )}
+                              </div>
+                              <span className="text-sm font-medium">{stage.label}</span>
+                              {stage.status === 'active' && (
+                                <div className="flex gap-1 ml-auto">
+                                  <span className="typing-dot w-1.5 h-1.5 bg-ocean-400 rounded-full" />
+                                  <span className="typing-dot w-1.5 h-1.5 bg-ocean-400 rounded-full" />
+                                  <span className="typing-dot w-1.5 h-1.5 bg-ocean-400 rounded-full" />
+                                </div>
+                              )}
+                            </motion.div>
+                          ))}
+                        </div>
+                        <p className="text-slate-400 text-sm">
+                          Analyzing earnings reports...
+                        </p>
+                      </>
+                    ) : (
+                      /* Simple loading indicator for chat */
+                      <div className="flex items-center gap-3 text-ocean-400">
+                        <Loader2 className="w-5 h-5 animate-spin" />
+                        <span className="text-sm font-medium">Thinking...</span>
+                      </div>
+                    )}
                   </div>
                 </motion.div>
               )}

@@ -1,12 +1,10 @@
 """
-Multi-agent system for earnings report summarization using LangGraph.
+Multi-agent system for earnings report summarization using LangGraph and web scraping.
 
 Flow:
-1. Query Analyzer Agent - Understands user query and extracts company info
-2. IR Finder Agent - Finds the investor relations site
-3. Document Extractor Agent - Extracts earnings report links
-4. Document Parser Agent - Parses and extracts content from reports
-5. Summarizer Agent - Generates comprehensive summary
+1. Query Analyzer Agent - Identifies ticker symbol and lists available transcripts via discountingcashflows.com
+2. Transcript Retriever Agent - Retrieves the full earnings call transcript by scraping discountingcashflows.com
+3. Summarizer Agent - Generates comprehensive summary from the transcript
 """
 
 from typing import TypedDict, Annotated, Sequence, List, Optional, Dict, Any
@@ -19,9 +17,7 @@ import operator
 import json
 
 from app.config import get_settings
-from app.tools.web_search import WebSearchTool, URLFetchTool
-from app.tools.investor_relations import InvestorRelationsTool, ExtractEarningsLinksTool
-from app.tools.document_parser import DocumentParserTool, HTMLDocumentTool
+from app.tools.investor_relations import TranscriptListTool, TranscriptTool
 
 
 class EarningsAgentState(TypedDict):
@@ -50,21 +46,13 @@ def create_earnings_agent():
         api_key=settings.openai_api_key,
     )
     
-    # Initialize tools
-    web_search_tool = WebSearchTool()
-    url_fetch_tool = URLFetchTool()
-    ir_finder_tool = InvestorRelationsTool()
-    earnings_links_tool = ExtractEarningsLinksTool()
-    pdf_parser_tool = DocumentParserTool()
-    html_parser_tool = HTMLDocumentTool()
+    # Initialize transcript tools
+    transcript_list_tool = TranscriptListTool()
+    transcript_tool = TranscriptTool()
     
     all_tools = [
-        web_search_tool,
-        url_fetch_tool,
-        ir_finder_tool,
-        earnings_links_tool,
-        pdf_parser_tool,
-        html_parser_tool,
+        transcript_list_tool,
+        transcript_tool,
     ]
     
     # Bind tools to LLM
@@ -81,20 +69,29 @@ def create_earnings_agent():
         system_prompt = """You are an expert at understanding user queries about companies and stocks.
         
 Your task is to:
-1. Identify the company name from the user's query
-2. Identify the ticker symbol if provided
-3. Determine if the user wants a specific type of earnings report (quarterly, annual, recent, etc.)
+1. Identify the ticker symbol from the user's query
+2. Use the list_earnings_transcripts tool with the ticker symbol to get available transcripts from discountingcashflows.com
 
-If the user only provides a ticker symbol, you should recognize common ones:
+Common ticker symbols:
 - AAPL = Apple
 - MSFT = Microsoft
 - GOOGL/GOOG = Google/Alphabet
 - AMZN = Amazon
 - META = Meta (Facebook)
 - NVDA = NVIDIA
+- NVDA = NVIDIA
 - TSLA = Tesla
+- NFLX = Netflix
+- AMD = AMD
+- INTC = Intel
+- CRM = Salesforce
+- ORCL = Oracle
+- ADBE = Adobe
+- IBM = IBM
+- CSCO = Cisco
 
-Respond with a brief analysis and then use the find_investor_relations tool to locate the company's IR site.
+If the user provides a company name instead of a ticker, convert it to the ticker symbol.
+Then immediately use list_earnings_transcripts to get the available earnings transcripts.
 """
         
         messages = [SystemMessage(content=system_prompt)] + list(state["messages"])
@@ -106,106 +103,138 @@ Respond with a brief analysis and then use the find_investor_relations tool to l
             "current_stage": "analyzing_query"
         }
     
-    def ir_finder(state: EarningsAgentState) -> Dict[str, Any]:
-        """Find the investor relations site for the company."""
+    def transcript_retriever(state: EarningsAgentState) -> Dict[str, Any]:
+        """Retrieve the earnings transcript content."""
         
-        system_prompt = """You are an expert at finding investor relations websites.
+        system_prompt = """You are an expert at retrieving earnings transcripts from discountingcashflows.com.
 
-Based on the company identified, use the find_investor_relations tool to locate the official IR site.
-Then use the extract_earnings_links tool to find the earnings reports.
+Once you have the list of available transcripts, select the most appropriate one based on the user's request:
+- If they want the most recent, choose the first one (most recent fiscal year and quarter)
+- If they specify a quarter/year, choose the matching one
+- Use the get_earnings_transcript tool with:
+  - symbol: The ticker symbol (e.g., "NVDA")
+  - fiscal_year: The fiscal year as a string (e.g., "2025")
+  - quarter: The quarter number as a string "1", "2", "3", or "4"
 
-Focus on finding:
-1. The official investor relations page (usually investor.company.com or company.com/investors)
-2. Links to recent earnings reports (10-K, 10-Q, quarterly earnings)
-3. Earnings call transcripts if available
+The transcript will contain the complete earnings call with all speakers and their statements scraped from discountingcashflows.com.
 
-Prioritize the most recent reports (current fiscal year).
+After retrieving the transcript, you do not need to do anything else - the system will automatically summarize it.
 """
         
-        messages = [SystemMessage(content=system_prompt)] + list(state["messages"])
+        messages_list = list(state["messages"])
+        messages = [SystemMessage(content=system_prompt)] + messages_list
         
         response = llm_with_tools.invoke(messages)
         
         return {
             "messages": [response],
-            "current_stage": "finding_ir_site"
+            "current_stage": "retrieving_transcript"
         }
     
-    def document_parser(state: EarningsAgentState) -> Dict[str, Any]:
-        """Parse and extract content from earnings documents."""
-        
-        system_prompt = """You are an expert at parsing financial documents.
-
-Based on the earnings links found, use the parse_pdf tool to extract content from PDF earnings reports.
-If the document is HTML-based, use the parse_html_document tool instead.
-
-Focus on parsing:
-1. The most recent quarterly earnings report (10-Q)
-2. The most recent annual report (10-K) if available
-3. Any earnings call transcripts
-
-Parse ONE document at a time to avoid overwhelming the system.
-Start with the most recent quarterly report if available.
-"""
-        
-        messages = [SystemMessage(content=system_prompt)] + list(state["messages"])
-        
-        response = llm_with_tools.invoke(messages)
-        
-        return {
-            "messages": [response],
-            "current_stage": "parsing_documents"
-        }
     
     def summarizer(state: EarningsAgentState) -> Dict[str, Any]:
         """Generate comprehensive summary of the earnings report."""
         
-        system_prompt = """You are an expert financial analyst specializing in earnings report analysis.
+        # Get all messages to find transcript content
+        messages_list = list(state["messages"])
+        
+        # Find transcript content in the messages
+        transcript_content = None
+        for msg in reversed(messages_list):
+            if hasattr(msg, 'content') and msg.content:
+                content_str = str(msg.content)
+                # Look for transcript indicators
+                if "Earnings Call Transcript" in content_str or "discountingcashflows.com" in content_str:
+                    # Make sure it's not just the header/template
+                    if len(content_str) > 1000 and not any(template in content_str.lower() for template in [
+                        'market is open', 'after-hours quote', 'last quote from'
+                    ]):
+                        transcript_content = content_str
+                        break
+        
+        if not transcript_content:
+            # Check if we have any substantial content
+            for msg in reversed(messages_list):
+                if hasattr(msg, 'content') and msg.content:
+                    content_str = str(msg.content)
+                    if len(content_str) > 500:
+                        transcript_content = content_str
+                        break
+        
+        system_prompt = """You are an expert financial analyst specializing in earnings call transcript analysis.
 
-Based on the parsed earnings documents, provide a comprehensive summary covering:
+You have been provided with an earnings call transcript in the conversation history. Your task is to analyze the transcript and generate a comprehensive, well-structured summary that highlights the KEY POINTS and most important information from the earnings call.
+
+IMPORTANT: Look through the conversation history above to find the earnings call transcript. The transcript content should be in one of the previous tool execution results. If you see content that looks like page navigation or template (e.g., "Market is Open", "After-Hours Quote"), that is NOT the transcript - keep looking for the actual transcript content which should contain speaker names, questions, answers, financial metrics, etc.
 
 ## Summary Structure
 
-### 1. Company Overview
-- Brief description of what the company does
-- Fiscal period covered in the report
+Generate a clear, structured summary with the following sections:
 
-### 2. Key Financial Highlights
-- Revenue (total and year-over-year change)
-- Net Income / Earnings Per Share (EPS)
-- Gross Margin and Operating Margin
-- Free Cash Flow
+### 📊 Executive Summary
+- Start with a brief 2-3 sentence overview highlighting the most critical points
+- Include the fiscal period (e.g., "Q4 FY2025")
 
-### 3. Business Segment Performance
-- Performance breakdown by business segment/product line
-- Notable growth or decline areas
+### 💰 Key Financial Highlights
+Extract and highlight:
+- **Revenue**: Total revenue and year-over-year (YoY) or quarter-over-quarter (QoQ) growth percentages
+- **Earnings Per Share (EPS)**: Actual vs. estimates if mentioned
+- **Profitability**: Net income, gross margin, operating margin
+- **Free Cash Flow**: If mentioned
+- **Financial guidance**: Forward-looking revenue/EPS guidance
 
-### 4. Key Metrics & KPIs
-- Company-specific metrics that matter (e.g., MAU for social media, subscribers for streaming)
-- Customer/user growth
-- Market share information if available
+### 🚀 Business Segment Performance
+- Performance breakdown by business segment or product line
+- Which segments/products showed strong growth
+- Which segments/products declined or faced challenges
+- Notable numbers and percentages for each segment
 
-### 5. Management Commentary & Outlook
-- Key points from management discussion
-- Forward guidance if provided
-- Major initiatives or strategic changes
+### 📈 Key Metrics & Operational Highlights
+- Company-specific metrics (e.g., for NVIDIA: data center revenue, gaming revenue, automotive revenue)
+- Customer/user growth numbers
+- Market share or competitive positioning mentions
+- Operational efficiency metrics
 
-### 6. Risks & Challenges
-- Key risk factors mentioned
-- Competitive pressures
+### 💬 Management Commentary & Strategic Outlook
+- **Key quotes** from the CEO/CFO highlighting important points
+- Strategic initiatives or pivots mentioned
+- Forward guidance and outlook for next quarter/year
+- Major strategic announcements or direction changes
+
+### ⚠️ Risks & Challenges Discussed
+- Risk factors mentioned by management
+- Competitive pressures discussed
 - Regulatory or market challenges
+- Supply chain or operational issues
 
-### 7. Notable Events
-- Acquisitions, divestitures, or restructuring
-- New product launches
-- Leadership changes
+### 🎯 Notable Events & Announcements
+- New product launches or announcements
+- Acquisitions, partnerships, or strategic deals
+- Leadership changes or organizational updates
+- Significant customer wins or contracts
 
-Provide specific numbers and percentages where available. Be concise but comprehensive.
-If certain information is not available in the parsed documents, note that.
-"""
+## Instructions:
+1. **Extract specific numbers**: Include actual dollar amounts, percentages, and growth rates mentioned in the transcript
+2. **Use quotes strategically**: Include important quotes from executives that highlight key points
+3. **Be comprehensive**: Cover all major topics discussed in the call
+4. **Highlight the most important points**: If revenue grew 200%, make that prominent
+5. **Format clearly**: Use bullet points, bold text (**like this**), and clear section headers
+6. **Be accurate**: Only include information that was actually mentioned in the transcript
+
+If certain information (like specific financial metrics) is not available in the transcript, you can note that, but still summarize what was discussed.
+
+IMPORTANT: Look through the conversation history above to find the earnings call transcript. It should have been retrieved using the get_earnings_transcript tool. The transcript content will be in one of the previous tool execution results. Once you find it, analyze it thoroughly and generate the comprehensive summary following the structure above.
+
+Make sure to highlight KEY POINTS with specific numbers, percentages, and important quotes from executives."""
         
-        messages = [SystemMessage(content=system_prompt)] + list(state["messages"])
+        # Include all messages (which contain the transcript from tool execution)
+        messages_list = list(state["messages"])
+        messages = [SystemMessage(content=system_prompt)] + messages_list
         
+        # Add explicit instruction to summarize
+        messages.append(HumanMessage(content="Please analyze the earnings call transcript that was retrieved above and generate a comprehensive summary with all key points, financial highlights, and management commentary."))
+        
+        # Use regular LLM (not with tools) since we're just summarizing
         response = llm.invoke(messages)
         
         return {
@@ -228,10 +257,8 @@ If certain information is not available in the parsed documents, note that.
         current_stage = state.get("current_stage", "analyzing_query")
         
         if current_stage == "analyzing_query":
-            return "ir_finder"
-        elif current_stage == "finding_ir_site":
-            return "document_parser"
-        elif current_stage == "parsing_documents":
+            return "transcript_retriever"
+        elif current_stage == "retrieving_transcript":
             return "summarizer"
         else:
             return "end"
@@ -243,10 +270,8 @@ If certain information is not available in the parsed documents, note that.
         # Stay in current stage to process tool results
         if current_stage == "analyzing_query":
             return "query_analyzer"
-        elif current_stage == "finding_ir_site":
-            return "ir_finder"
-        elif current_stage == "parsing_documents":
-            return "document_parser"
+        elif current_stage == "retrieving_transcript":
+            return "transcript_retriever"
         else:
             return "summarizer"
     
@@ -256,8 +281,7 @@ If certain information is not available in the parsed documents, note that.
     
     # Add nodes
     workflow.add_node("query_analyzer", query_analyzer)
-    workflow.add_node("ir_finder", ir_finder)
-    workflow.add_node("document_parser", document_parser)
+    workflow.add_node("transcript_retriever", transcript_retriever)
     workflow.add_node("summarizer", summarizer)
     workflow.add_node("tools", tool_node)
     
@@ -270,23 +294,13 @@ If certain information is not available in the parsed documents, note that.
         should_use_tools,
         {
             "tools": "tools",
-            "ir_finder": "ir_finder",
+            "transcript_retriever": "transcript_retriever",
             "end": END
         }
     )
     
     workflow.add_conditional_edges(
-        "ir_finder",
-        should_use_tools,
-        {
-            "tools": "tools",
-            "document_parser": "document_parser",
-            "end": END
-        }
-    )
-    
-    workflow.add_conditional_edges(
-        "document_parser",
+        "transcript_retriever",
         should_use_tools,
         {
             "tools": "tools",
@@ -300,8 +314,7 @@ If certain information is not available in the parsed documents, note that.
         after_tools,
         {
             "query_analyzer": "query_analyzer",
-            "ir_finder": "ir_finder",
-            "document_parser": "document_parser",
+            "transcript_retriever": "transcript_retriever",
             "summarizer": "summarizer",
         }
     )

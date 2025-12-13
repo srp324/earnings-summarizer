@@ -1,6 +1,9 @@
-from app.tools.web_search import WebSearchTool
-from app.tools.document_parser import DocumentParserTool
-from app.tools.investor_relations import InvestorRelationsTool
+"""Tools for earnings analysis using web scraping."""
 
-__all__ = ["WebSearchTool", "DocumentParserTool", "InvestorRelationsTool"]
+from app.tools.investor_relations import TranscriptListTool, TranscriptTool
+
+__all__ = [
+    "TranscriptListTool",
+    "TranscriptTool",
+]
 
