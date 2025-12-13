@@ -329,7 +329,7 @@ class TranscriptTool(BaseTool):
     Retrieve the full content of an earnings call transcript using symbol, fiscal year, and quarter.
     If fiscal_year or quarter is not provided, will automatically use the most recent available transcript.
     
-    IMPORTANT: When the user specifies a fiscal year and quarter (e.g., "FY2025Q2", "FY 2025 Q2", "2025 Q2"), 
+    IMPORTANT: When the user specifies a fiscal year and quarter (e.g., "FY2025Q2", "FY 2025 Q2", "2025 Q2", "2022Q2"), 
     you MUST extract and pass them as separate parameters:
     - fiscal_year: Extract the year (e.g., "2025" from "FY2025Q2")
     - quarter: Extract the quarter number (e.g., "2" from "FY2025Q2")
@@ -768,297 +768,150 @@ class TranscriptTool(BaseTool):
                 return f"**Error:** Could not find any available transcripts for {symbol_upper}. Please use list_earnings_transcripts to see available transcripts."
         
         logger.info(f"=== _arun called for {symbol_upper} FY{fiscal_year} Q{quarter} ===")
-        # Since discountingcashflows.com uses JavaScript rendering, use Playwright directly
-        logger.info(f"Using async Playwright to fetch transcript for {symbol_upper} FY{fiscal_year} Q{quarter}")
-        
-        symbol_upper = symbol.upper().strip()
+        # Since discountingcashflows.com uses JavaScript rendering, use Playwright as primary method
         fiscal_year_clean = re.sub(r'[^\d]', '', fiscal_year)
         quarter_clean = quarter.strip()
         
         # Build the URL - construct directly since we know the pattern
         transcript_url = f"{DCF_BASE_URL}/company/{symbol_upper}/transcripts/{fiscal_year_clean}/{quarter_clean}/"
         
-        # The HTMX API endpoint that returns the transcript HTML
-        htmx_api_url = f"{transcript_url}?org.htmx.cache-buster=transcriptsContent"
-        
+        # Use Playwright to render the page (primary method for JavaScript-rendered content)
         try:
-            # Try direct API call first (faster and more reliable than Playwright)
-            logger.info(f"Attempting direct API call to: {htmx_api_url}")
-            try:
-                async with httpx.AsyncClient(timeout=30.0) as client:
-                    logger.info(f"Making HTTP GET request to HTMX API...")
-                    api_response = await client.get(htmx_api_url, headers={
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
-                    })
-                    if api_response.status_code == 200:
-                        # Parse the HTML response from the API
-                        from bs4 import BeautifulSoup
-                        api_soup = BeautifulSoup(api_response.text, 'html.parser')
-                        
-                        logger.info(f"API response received, HTML length: {len(api_response.text)}")
-                        
-                        # Check if the API response contains just a link (not actual content)
-                        # If it's just a link, we'll need to use Playwright
-                        links = api_soup.find_all('a')
-                        if len(links) == 1 and len(api_soup.find_all('div')) == 0:
-                            logger.info("HTMX API returned only a link, skipping direct API approach - will use full page navigation")
-                            raise Exception("HTMX API returned link only, need full page")
-                        
-                        # Find all div.flex.flex-col.my-5 elements, then get the second child div (which should be p-4)
-                        logger.info("Searching for div.flex.flex-col.my-5 elements in API response")
-                        
-                        # Try different ways to match classes - BeautifulSoup stores classes as a list
-                        def match_flex_my5_classes(class_attr):
-                            if not class_attr:
-                                return False
-                            # Handle both list and string formats
-                            if isinstance(class_attr, list):
-                                class_str = ' '.join(class_attr)
-                            else:
-                                class_str = str(class_attr)
-                            return 'flex' in class_str and 'flex-col' in class_str and 'my-5' in class_str
-                        
-                        # The API response should already be filtered to the specific transcript
-                        # But we can still look for a container to be safe
-                        api_main_container = api_soup.find(id='transcriptsContent')
-                        if not api_main_container:
-                            api_main_container = api_soup.find('main')
-                        
-                        all_flex_my5_divs = api_soup.find_all('div', class_=match_flex_my5_classes)
-                        logger.info(f"Found {len(all_flex_my5_divs)} div.flex.flex-col.my-5 elements in API response")
-                        
-                        # Filter to main container if it exists
-                        if api_main_container:
-                            flex_my5_divs = []
-                            for div in all_flex_my5_divs:
-                                parent = div.parent
-                                is_in_container = False
-                                while parent:
-                                    if parent == api_main_container:
-                                        is_in_container = True
-                                        break
-                                    if parent == api_soup or parent.name == '[document]':
-                                        break
-                                    parent = parent.parent
-                                if is_in_container:
-                                    flex_my5_divs.append(div)
-                            logger.info(f"After filtering to main container, {len(flex_my5_divs)} div.flex.flex-col.my-5 elements remain")
-                        else:
-                            flex_my5_divs = all_flex_my5_divs
-                        
-                        transcript_parts = []
-                        for i, flex_div in enumerate(flex_my5_divs):
-                            # Get all direct child divs (not recursive)
-                            child_divs = [child for child in flex_div.children 
-                                         if hasattr(child, 'name') and child.name and child.name == 'div']
-                            
-                            logger.info(f"Flex div {i+1}/{len(flex_my5_divs)}: has {len(child_divs)} direct child divs")
-                            
-                            # Get the second child div (index 1) which should be the p-4 div
-                            if len(child_divs) >= 2:
-                                second_child = child_divs[1]
-                                child_classes = second_child.get('class', [])
-                                class_str = ' '.join(child_classes) if isinstance(child_classes, list) else str(child_classes)
-                                
-                                if 'p-4' in class_str:
-                                    text = second_child.get_text(separator=' ', strip=True)
-                                    text_length = len(text.strip()) if text else 0
-                                    
-                                    # Log preview instead of full text (can be very long)
-                                    logger.info(f"  P-4 div {i+1}: length={text_length} chars")
-                                    logger.info(f"  P-4 div {i+1} PREVIEW: {text[:200]}...")
-                                    
-                                    if text:
-                                        transcript_parts.append(text.strip())
-                                else:
-                                    logger.warning(f"  -> Second child div doesn't have p-4 class: '{class_str}'")
-                            else:
-                                logger.warning(f"  -> Flex div doesn't have 2 child divs, found {len(child_divs)}")
-                        
-                        # Filter to ensure we only get content from the correct fiscal year/quarter
-                        # Since the API URL is already specific to the year/quarter, all parts should be relevant
-                        # But we can add validation to ensure content matches
-                        if transcript_parts:
-                            logger.info(f"Extracted {len(transcript_parts)} transcript parts before filtering")
-                            # All parts should be from the correct transcript since URL is specific
-                            # But log a summary to help debug if wrong content appears
-                            for i, part in enumerate(transcript_parts[:3]):  # Log first 3 parts
-                                logger.info(f"  Part {i+1} preview: {part[:150]}...")
-                        
-                        if transcript_parts:
-                            transcript_content = '\n\n'.join(transcript_parts)
-                            logger.info(f"Successfully extracted {len(transcript_content)} characters from {len(transcript_parts)} p-4 divs")
-                            logger.info(f"First 500 chars of combined content: {transcript_content[:500]}...")
-                            
-                            if len(transcript_content) > 500:
-                                output = "**Earnings Call Transcript:**\n\n"
-                                output += f"**Company:** {symbol_upper}\n"
-                                output += f"**Period:** FY{fiscal_year_clean} Q{quarter_clean}\n"
-                                output += f"**Source:** discountingcashflows.com\n"
-                                output += "\n---\n\n"
-                                output += transcript_content
-                                output += f"\n\n---\n\n_Transcript length: {len(transcript_content):,} characters_\n"
-                                output += f"_Source URL: {transcript_url}_"
-                                logger.info(f"Returning transcript with {len(transcript_content)} characters")
-                                return output
-                            else:
-                                logger.warning(f"Extracted content too short: {len(transcript_content)} characters (minimum: 500)")
-                        else:
-                            logger.warning("No p-4 divs found in flex.flex-col.my-5 elements")
-                            # Log some debugging info
-                            all_divs = api_soup.find_all('div')
-                            logger.info(f"Total divs in API response: {len(all_divs)}")
-                            if all_divs:
-                                # Show classes of first few divs
-                                for i, div in enumerate(all_divs[:5]):
-                                    classes = div.get('class', [])
-                                    class_str = ' '.join(classes) if isinstance(classes, list) else str(classes)
-                                    logger.info(f"Div {i} classes: {class_str}")
-            except Exception as api_err:
-                err_msg = str(api_err)
-                if "HTMX API returned link only" in err_msg:
-                    logger.info("HTMX API returned link only, will use full page navigation with Playwright")
-                else:
-                    logger.warning(f"Direct HTMX API call failed: {err_msg}, falling back to Playwright")
+            from playwright.async_api import async_playwright
+            logger.info(f"Using Playwright to render JavaScript content for {symbol_upper} FY{fiscal_year_clean} Q{quarter_clean}...")
             
-            # Use Playwright to render the page (fallback if API call fails)
-            try:
-                from playwright.async_api import async_playwright
-                logger.info("Attempting to use Playwright async API to render JavaScript content...")
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True)
+                context = await browser.new_context(
+                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                )
+                page = await context.new_page()
                 
-                async with async_playwright() as p:
-                    browser = await p.chromium.launch(headless=True)
-                    context = await browser.new_context(
-                        user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                # Navigate to the full transcript page
+                logger.info(f"Navigating to full transcript page: {transcript_url}")
+                await page.goto(transcript_url, wait_until="domcontentloaded", timeout=30000)
+                
+                # Wait for the transcriptsContent element to appear
+                try:
+                    await page.wait_for_selector('#transcriptsContent', timeout=15000)
+                    logger.info("Found transcriptsContent element after page load")
+                except Exception:
+                    logger.warning("transcriptsContent element not found immediately")
+                
+                # Wait for HTMX to load the actual content (not just the link)
+                # The content is loaded dynamically via HTMX after the page loads
+                await page.wait_for_timeout(3000)
+                
+                # Wait for the transcriptsContent to have actual content (not just a link)
+                try:
+                    await page.wait_for_function(
+                        '''
+                        () => {
+                            const elem = document.getElementById("transcriptsContent");
+                            if (!elem) return false;
+                            // Check if it has divs, not just links
+                            const divs = elem.querySelectorAll("div");
+                            const links = elem.querySelectorAll("a");
+                            return divs.length > 0 && divs.length > links.length;
+                        }
+                        ''',
+                        timeout=15000
                     )
-                    page = await context.new_page()
-                    
-                    # Navigate to the full transcript page
-                    logger.info(f"Navigating to full transcript page: {transcript_url}")
-                    await page.goto(transcript_url, wait_until="domcontentloaded", timeout=30000)
-                    
-                    # Wait for the transcriptsContent element to appear
-                    try:
-                        await page.wait_for_selector('#transcriptsContent', timeout=15000)
-                        logger.info("Found transcriptsContent element after page load")
-                    except Exception:
-                        logger.warning("transcriptsContent element not found immediately")
-                    
-                    # Wait for HTMX to load the actual content (not just the link)
-                    # The content is loaded dynamically via HTMX after the page loads
-                    await page.wait_for_timeout(3000)
-                    
-                    # Wait for the transcriptsContent to have actual content (not just a link)
-                    try:
-                        await page.wait_for_function(
-                            '''
-                            () => {
-                                const elem = document.getElementById("transcriptsContent");
-                                if (!elem) return false;
-                                // Check if it has divs, not just links
-                                const divs = elem.querySelectorAll("div");
-                                const links = elem.querySelectorAll("a");
-                                return divs.length > 0 && divs.length > links.length;
-                            }
-                            ''',
-                            timeout=15000
-                        )
-                        logger.info("Confirmed transcriptsContent has div content (not just links)")
-                    except Exception as playwright_err:
-                        logger.warning("Timeout waiting for transcriptsContent to populate with divs")
-                    
-                    # Additional wait to ensure content is fully rendered
-                    await page.wait_for_timeout(2000)
-                    
-                    # Final wait for network to be idle
-                    await page.wait_for_load_state("networkidle", timeout=5000)
-                    
-                    # Get the rendered HTML
-                    rendered_html = await page.content()
-                    await browser.close()
-                    
-                    # Log the rendered HTML length
-                    logger.info(f"Rendered HTML length: {len(rendered_html)} characters")
-                    
-                    # Parse and extract content
-                    rendered_soup = BeautifulSoup(rendered_html, 'html.parser')
-                    
-                    # Extract transcript content BEFORE removing unwanted elements
-                    # This is critical because the cleanup process may remove parent elements
-                    def match_flex_my5_classes(class_attr):
-                        if not class_attr:
-                            return False
-                        if isinstance(class_attr, list):
-                            class_str = ' '.join(class_attr)
-                        else:
-                            class_str = str(class_attr)
-                        return 'flex' in class_str and 'flex-col' in class_str and 'my-5' in class_str
-                    
-                    # First, try to find the main transcript container to filter out sidebar/other transcripts
-                    main_transcript_container = None
-                    transcripts_content = rendered_soup.find(id='transcriptsContent')
-                    if transcripts_content:
-                        logger.info("Found transcriptsContent container, will extract only from within it")
-                        main_transcript_container = transcripts_content
+                    logger.info("Confirmed transcriptsContent has div content (not just links)")
+                except Exception as playwright_err:
+                    logger.warning("Timeout waiting for transcriptsContent to populate with divs")
+                
+                # Additional wait to ensure content is fully rendered
+                await page.wait_for_timeout(2000)
+                
+                # Final wait for network to be idle
+                await page.wait_for_load_state("networkidle", timeout=5000)
+                
+                # Get the rendered HTML
+                rendered_html = await page.content()
+                await browser.close()
+                
+                # Log the rendered HTML length
+                logger.info(f"Rendered HTML length: {len(rendered_html)} characters")
+                
+                # Parse and extract content
+                rendered_soup = BeautifulSoup(rendered_html, 'html.parser')
+                
+                # Extract transcript content BEFORE removing unwanted elements
+                # This is critical because the cleanup process may remove parent elements
+                def match_flex_my5_classes(class_attr):
+                    if not class_attr:
+                        return False
+                    if isinstance(class_attr, list):
+                        class_str = ' '.join(class_attr)
                     else:
-                        # Look for main content area (not sidebar)
-                        main_content = rendered_soup.find('main')
-                        if main_content:
-                            logger.info("Found main content area, will extract from it")
-                            main_transcript_container = main_content
-                        else:
-                            logger.info("No specific container found, will extract from all flex.flex-col.my-5 elements")
-                    
-                    # Find all div.flex.flex-col.my-5 elements BEFORE cleanup
-                    all_flex_my5_divs = rendered_soup.find_all('div', class_=match_flex_my5_classes)
-                    logger.info(f"Found {len(all_flex_my5_divs)} div.flex.flex-col.my-5 elements BEFORE removing unwanted elements")
-                    
-                    # Filter to only include elements within the main transcript container
-                    if main_transcript_container:
-                        flex_my5_divs = []
-                        for div in all_flex_my5_divs:
-                            # Check if this div is a descendant of the main container
-                            parent = div.parent
-                            is_in_container = False
-                            while parent:
-                                if parent == main_transcript_container:
-                                    is_in_container = True
-                                    break
-                                if parent == rendered_soup or parent.name == '[document]':
-                                    break
-                                parent = parent.parent
-                            if is_in_container:
-                                flex_my5_divs.append(div)
-                        logger.info(f"After filtering to main container, {len(flex_my5_divs)} div.flex.flex-col.my-5 elements remain")
+                        class_str = str(class_attr)
+                    return 'flex' in class_str and 'flex-col' in class_str and 'my-5' in class_str
+                
+                # First, try to find the main transcript container to filter out sidebar/other transcripts
+                main_transcript_container = None
+                transcripts_content = rendered_soup.find(id='transcriptsContent')
+                if transcripts_content:
+                    logger.info("Found transcriptsContent container, will extract only from within it")
+                    main_transcript_container = transcripts_content
+                else:
+                    # Look for main content area (not sidebar)
+                    main_content = rendered_soup.find('main')
+                    if main_content:
+                        logger.info("Found main content area, will extract from it")
+                        main_transcript_container = main_content
                     else:
-                        flex_my5_divs = all_flex_my5_divs
+                        logger.info("No specific container found, will extract from all flex.flex-col.my-5 elements")
+                
+                # Find all div.flex.flex-col.my-5 elements BEFORE cleanup
+                all_flex_my5_divs = rendered_soup.find_all('div', class_=match_flex_my5_classes)
+                logger.info(f"Found {len(all_flex_my5_divs)} div.flex.flex-col.my-5 elements BEFORE removing unwanted elements")
+                
+                # Filter to only include elements within the main transcript container
+                if main_transcript_container:
+                    flex_my5_divs = []
+                    for div in all_flex_my5_divs:
+                        # Check if this div is a descendant of the main container
+                        parent = div.parent
+                        is_in_container = False
+                        while parent:
+                            if parent == main_transcript_container:
+                                is_in_container = True
+                                break
+                            if parent == rendered_soup or parent.name == '[document]':
+                                break
+                            parent = parent.parent
+                        if is_in_container:
+                            flex_my5_divs.append(div)
+                    logger.info(f"After filtering to main container, {len(flex_my5_divs)} div.flex.flex-col.my-5 elements remain")
+                else:
+                    flex_my5_divs = all_flex_my5_divs
+                
+                transcript_content = ""
+                transcript_parts = []
+                
+                # Extract content from all flex.flex-col.my-5 elements
+                for i, flex_div in enumerate(flex_my5_divs):
+                    # Get all direct child divs (not recursive)
+                    child_divs = [child for child in flex_div.children 
+                                 if hasattr(child, 'name') and child.name and child.name == 'div']
                     
-                    transcript_content = ""
-                    transcript_parts = []
-                    
-                    # Extract content from all flex.flex-col.my-5 elements
-                    for i, flex_div in enumerate(flex_my5_divs):
-                        # Get all direct child divs (not recursive)
-                        child_divs = [child for child in flex_div.children 
-                                     if hasattr(child, 'name') and child.name and child.name == 'div']
+                    # Get the second child div (index 1) which should be the p-4 div
+                    if len(child_divs) >= 2:
+                        second_child = child_divs[1]
+                        child_classes = second_child.get('class', [])
+                        class_str = ' '.join(child_classes) if isinstance(child_classes, list) else str(child_classes)
                         
-                        # Get the second child div (index 1) which should be the p-4 div
-                        if len(child_divs) >= 2:
-                            second_child = child_divs[1]
-                            child_classes = second_child.get('class', [])
-                            class_str = ' '.join(child_classes) if isinstance(child_classes, list) else str(child_classes)
+                        if 'p-4' in class_str:
+                            text = second_child.get_text(separator=' ', strip=True)
+                            text_length = len(text.strip()) if text else 0
                             
-                            if 'p-4' in class_str:
-                                text = second_child.get_text(separator=' ', strip=True)
-                                text_length = len(text.strip()) if text else 0
-                                
-                                if text:
-                                    transcript_parts.append(text.strip())
-                            else:
-                                logger.warning(f"  -> Second child div doesn't have p-4 class: '{class_str}'")
+                            if text:
+                                transcript_parts.append(text.strip())
                         else:
-                            logger.warning(f"  -> Flex div doesn't have 2 child divs, found {len(child_divs)}")
+                            logger.warning(f"  -> Second child div doesn't have p-4 class: '{class_str}'")
+                    else:
+                        logger.warning(f"  -> Flex div doesn't have 2 child divs, found {len(child_divs)}")
                     
                     # Filter transcript parts to only include content from the correct fiscal year/quarter
                     # Check if the page contains multiple transcripts and filter accordingly
@@ -1260,12 +1113,12 @@ class TranscriptTool(BaseTool):
                     if not transcript_content:
                         reasons_str = '; '.join(extraction_reasons) if extraction_reasons else "Unknown reason"
                         logger.warning(f"Could not extract transcript content from rendered page. Page length: {len(rendered_html)}. Reasons: {reasons_str}")
-            except ImportError:
-                logger.warning("Playwright not available, skipping JavaScript rendering")
-            except Exception as playwright_err:
-                logger.error(f"Playwright async rendering failed: {str(playwright_err)}")
-                import traceback
-                logger.error(traceback.format_exc())
+        except ImportError:
+            logger.warning("Playwright not available, skipping JavaScript rendering")
+        except Exception as playwright_err:
+            logger.error(f"Playwright async rendering failed: {str(playwright_err)}")
+            import traceback
+            logger.error(traceback.format_exc())
             
         except Exception as e:
             logger.error(f"Async transcript fetch failed: {str(e)}")
