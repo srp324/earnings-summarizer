@@ -127,8 +127,14 @@ function App() {
                   const status = data.status === 'active' ? 'active' : 
                                 data.status === 'complete' ? 'complete' : 'pending'
                   
-                  // Update the specific stage
-                  updateStage(stageId, status)
+                  // Update the specific stage with label if provided by backend
+                  if (data.stage_label) {
+                    setCurrentStages(prev => prev.map(s => 
+                      s.id === stageId ? { ...s, label: data.stage_label, status } : s
+                    ))
+                  } else {
+                    updateStage(stageId, status)
+                  }
                   
                   // Mark previous stages as complete
                   const stageIndex = stages.findIndex(s => s.id === stageId)
@@ -430,7 +436,7 @@ function App() {
                 ) : (
                   <>
                     <Send className="w-5 h-5" />
-                    Analyze
+                    Send
                   </>
                 )}
               </motion.button>

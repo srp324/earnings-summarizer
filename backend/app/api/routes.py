@@ -361,17 +361,18 @@ async def chat_stream(
                         if isinstance(msg, dict):
                             role = msg.get("role", "")
                             content = msg.get("content", "")
-                            if role == "assistant" and content and len(content) > 200:
+                            # Accept assistant messages (clarification messages may be shorter)
+                            if role == "assistant" and content and len(content) > 10:
                                 summary = content
                                 break
                         elif hasattr(msg, 'content') and hasattr(msg, 'role'):
                             if hasattr(msg, 'role') and (msg.role == "assistant" or isinstance(msg, AIMessage)):
-                                if hasattr(msg, 'content') and msg.content and len(str(msg.content)) > 200:
+                                if hasattr(msg, 'content') and msg.content and len(str(msg.content)) > 10:
                                     summary = str(msg.content)
                                     break
                 
-                # Fallback message if still no summary
-                if not summary or len(summary.strip()) < 50:
+                # Fallback message if still no summary (only for actual analysis failures, not clarifications)
+                if not summary or (len(summary.strip()) < 50 and "specify which quarter" not in summary.lower() and "need you to specify" not in summary.lower()):
                     summary = "Unable to generate a comprehensive summary. The transcript may not have been fully extracted, or there was an error processing it."
                 
                 # Add assistant message to history
@@ -517,18 +518,18 @@ async def chat(
                     if isinstance(msg, dict):
                         role = msg.get("role", "")
                         content = msg.get("content", "")
-                        # If it's an assistant message with substantial content, use it
-                        if role == "assistant" and content and len(content) > 200:
+                        # Accept assistant messages (clarification messages may be shorter)
+                        if role == "assistant" and content and len(content) > 10:
                             summary = content
                             break
                     elif hasattr(msg, 'content') and hasattr(msg, 'role'):
                         if hasattr(msg, 'role') and (msg.role == "assistant" or isinstance(msg, AIMessage)):
-                            if hasattr(msg, 'content') and msg.content and len(str(msg.content)) > 200:
+                            if hasattr(msg, 'content') and msg.content and len(str(msg.content)) > 10:
                                 summary = str(msg.content)
                                 break
             
-            # Fallback message if still no summary
-            if not summary or len(summary.strip()) < 50:
+            # Fallback message if still no summary (only for actual analysis failures, not clarifications)
+            if not summary or (len(summary.strip()) < 50 and "specify which quarter" not in summary.lower() and "need you to specify" not in summary.lower()):
                 summary = "Unable to generate a comprehensive summary. The transcript may not have been fully extracted, or there was an error processing it."
             
             # Add assistant message to history

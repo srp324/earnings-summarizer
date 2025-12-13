@@ -12,6 +12,7 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
+import re
 
 from app.config import get_settings
 
@@ -47,7 +48,10 @@ Your job is to classify user input into one of these categories:
 
 1. **new_analysis**: User wants to analyze a NEW company's earnings
    - Examples: "Apple", "Analyze Tesla", "NVDA", "Tell me about Microsoft's earnings"
-   - Extract the company name/ticker
+   - Also includes when user provides incomplete information that should be combined with previous context
+   - Examples: "Q1" after "NVDA 2022" should be classified as new_analysis with full context "NVDA 2022 Q1"
+   - Extract the company name/ticker, and if the current input is incomplete (like just "Q1"), 
+     combine it with information from the conversation history
 
 2. **follow_up_question**: User is asking for MORE DETAIL about the CURRENT analysis
    - Examples: "Tell me about business segments", "What were the key metrics?", 
@@ -60,15 +64,32 @@ Your job is to classify user input into one of these categories:
 4. **general_chat**: General conversation not related to earnings
    - Examples: "How are you?", "What can you do?", "Help"
 
-IMPORTANT: 
+CRITICAL CONTEXT AWARENESS:
+- ALWAYS look at the conversation history to understand context
+- If user says "Q1", "Q2", etc. and previous messages mention a company and year, 
+  this is a continuation/new_analysis that should combine the information
+- If user says "NVDA 2022" and then "Q1", the second message should be classified as 
+  new_analysis with extracted_company="NVDA 2022 Q1"
+- If the previous assistant message asked for a quarter, and user provides just "Q1", 
+  extract the company and year from earlier messages and combine them
 - If a user answers "yes", "sure", "okay" etc. to a question about deeper analysis, 
   classify as 'follow_up_question' NOT 'new_analysis'
 - Be contextually aware - "yes" after asking about deeper dive = follow_up_question
 - Look for company names, ticker symbols for new_analysis
 - Short affirmative responses during conversation = follow_up_question
 
-Return your classification with confidence and reasoning."""),
-            ("human", "Previous assistant message: {previous_message}\n\nUser input: {user_input}")
+Return your classification with confidence and reasoning. If the current input is incomplete 
+(like just "Q1"), extract the full context from conversation history and include it in extracted_company."""),
+            ("human", """Conversation History:
+{conversation_history}
+
+Previous assistant message: {previous_message}
+
+Current user input: {user_input}
+
+Based on the conversation history above, classify the user's intent. If the current input is incomplete 
+(like "Q1" or "Q2"), look at previous messages to find the company name/ticker and year, and combine 
+them in your extracted_company field (e.g., "NVDA 2022 Q1").""")
         ])
     
     async def classify_intent(
@@ -94,13 +115,24 @@ Return your classification with confidence and reasoning."""),
         # Structure the classification request
         structured_llm = self.llm.with_structured_output(IntentClassification)
         
-        # Build context
+        # Build context from conversation history
         prev_msg = previous_message or "No previous message"
+        
+        # Format conversation history for the prompt
+        history_text = "No previous messages"
+        if conversation_history:
+            history_lines = []
+            for msg in conversation_history[-10:]:  # Last 10 messages for context
+                role = msg.get("role", "unknown")
+                content = msg.get("content", "")
+                history_lines.append(f"{role.upper()}: {content}")
+            history_text = "\n".join(history_lines)
         
         result = await structured_llm.ainvoke(
             self.classifier_prompt.format_messages(
                 user_input=user_input,
-                previous_message=prev_msg
+                previous_message=prev_msg,
+                conversation_history=history_text
             )
         )
         
@@ -286,10 +318,16 @@ Based on this analysis, answer the user's follow-up question. Be specific and re
 details from the analysis. If the question asks for information not in the analysis, 
 politely explain that and offer to provide what information is available."""
         
-        messages = [
-            SystemMessage(content=system_msg),
-            HumanMessage(content=user_input)
-        ]
+        messages = [SystemMessage(content=system_msg)]
+        
+        # Add recent conversation history for context
+        for msg in conversation_history[-6:]:  # Last 6 messages for context
+            if msg["role"] == "user":
+                messages.append(HumanMessage(content=msg["content"]))
+            elif msg["role"] == "assistant":
+                messages.append(AIMessage(content=msg["content"]))
+        
+        messages.append(HumanMessage(content=user_input))
         
     elif intent == "general_chat":
         # General conversation
@@ -315,11 +353,19 @@ name or ticker symbol."""
         messages.append(HumanMessage(content=user_input))
     
     else:
-        # Default response
+        # Default response with conversation history
         messages = [
-            SystemMessage(content="You are a helpful earnings analysis assistant."),
-            HumanMessage(content=user_input)
+            SystemMessage(content="You are a helpful earnings analysis assistant.")
         ]
+        
+        # Add recent conversation history for context
+        for msg in conversation_history[-6:]:  # Last 6 messages for context
+            if msg["role"] == "user":
+                messages.append(HumanMessage(content=msg["content"]))
+            elif msg["role"] == "assistant":
+                messages.append(AIMessage(content=msg["content"]))
+        
+        messages.append(HumanMessage(content=user_input))
     
     response = await llm.ainvoke(messages)
     return response.content
