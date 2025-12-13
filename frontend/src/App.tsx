@@ -19,8 +19,8 @@ interface AnalysisStage {
 
 const stages: AnalysisStage[] = [
   { id: 'analyzing', label: 'Analyzing Query', status: 'pending', icon: <Search className="w-4 h-4" /> },
-  { id: 'searching', label: 'Finding IR Site', status: 'pending', icon: <TrendingUp className="w-4 h-4" /> },
-  { id: 'parsing', label: 'Parsing Reports', status: 'pending', icon: <FileText className="w-4 h-4" /> },
+  { id: 'searching', label: 'Retrieving Reports', status: 'pending', icon: <TrendingUp className="w-4 h-4" /> },
+  { id: 'parsing', label: 'Storing Embeddings', status: 'pending', icon: <FileText className="w-4 h-4" /> },
   { id: 'summarizing', label: 'Generating Summary', status: 'pending', icon: <Sparkles className="w-4 h-4" /> },
 ]
 
@@ -70,8 +70,8 @@ function App() {
     setShowWelcome(false)
 
     try {
-      // Use the new chat endpoint that handles routing
-      const response = await fetch('/api/v1/chat', {
+      // Use the streaming chat endpoint for real-time updates
+      const response = await fetch('/api/v1/chat/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ 
@@ -84,61 +84,137 @@ function App() {
         throw new Error(`HTTP error! status: ${response.status}`)
       }
 
-      const data = await response.json()
-      
-      // Store session ID for conversation continuity
-      if (data.session_id) {
-        setSessionId(data.session_id)
-      }
-
-      // Check if this triggered an analysis
-      if (data.action_taken === 'analysis_triggered') {
-        // Show stages for analysis
-        setIsAnalyzing(true)
-        resetStages()
+      // Check if response is streaming (SSE)
+      const contentType = response.headers.get('content-type')
+      if (contentType?.includes('text/event-stream')) {
+        // Handle Server-Sent Events
+        const reader = response.body?.getReader()
+        const decoder = new TextDecoder()
         
-        // Simulate stage progression for UI feedback
-        const stageProgression = async () => {
-          updateStage('analyzing', 'active')
-          await new Promise(r => setTimeout(r, 800))
-          updateStage('analyzing', 'complete')
-          
-          updateStage('searching', 'active')
-          await new Promise(r => setTimeout(r, 1200))
-          updateStage('searching', 'complete')
-          
-          updateStage('parsing', 'active')
-          await new Promise(r => setTimeout(r, 1500))
-          updateStage('parsing', 'complete')
-          
-          updateStage('summarizing', 'active')
-          await new Promise(r => setTimeout(r, 500))
-          updateStage('summarizing', 'complete')
+        if (!reader) {
+          throw new Error('Response body is not readable')
         }
 
-        await stageProgression()
-        setIsAnalyzing(false)
-      }
+        let buffer = ''
+        let assistantContent = ''
+        let receivedSessionId = sessionId
+        let actionTaken = 'chat'
 
-      // If this was an analysis, check for summary in analysis_result
-      let assistantContent = data.message || data.error || 'Unable to generate response. Please try again.'
-      
-      if (data.action_taken === 'analysis_triggered' && data.analysis_result) {
-        // Prefer summary from analysis_result, fallback to message
-        assistantContent = data.analysis_result.summary || data.analysis_result.message || assistantContent
+        while (true) {
+          const { done, value } = await reader.read()
+          
+          if (done) break
+
+          buffer += decoder.decode(value, { stream: true })
+          const lines = buffer.split('\n\n')
+          buffer = lines.pop() || '' // Keep incomplete line in buffer
+
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              try {
+                const data = JSON.parse(line.slice(6))
+                
+                // Handle different event types
+                if (data.type === 'status') {
+                  // Status update - show thinking indicator
+                  if (data.stage === 'thinking') {
+                    setIsAnalyzing(false)
+                  }
+                } else if (data.type === 'stage_update') {
+                  // Stage update - update UI in real-time
+                  setIsAnalyzing(true)
+                  const stageId = data.stage_id
+                  const status = data.status === 'active' ? 'active' : 
+                                data.status === 'complete' ? 'complete' : 'pending'
+                  
+                  // Update the specific stage
+                  updateStage(stageId, status)
+                  
+                  // Mark previous stages as complete
+                  const stageIndex = stages.findIndex(s => s.id === stageId)
+                  if (stageIndex > 0) {
+                    for (let i = 0; i < stageIndex; i++) {
+                      const prevStage = stages[i]
+                      if (prevStage.id !== stageId) {
+                        updateStage(prevStage.id, 'complete')
+                      }
+                    }
+                  }
+                } else if (data.type === 'complete') {
+                  // Final result received
+                  assistantContent = data.message || assistantContent
+                  receivedSessionId = data.session_id || receivedSessionId
+                  actionTaken = data.action_taken || 'chat'
+                  
+                  // Mark all stages as complete if this was an analysis
+                  if (actionTaken === 'analysis_triggered') {
+                    stages.forEach(stage => {
+                      updateStage(stage.id, 'complete')
+                    })
+                    setIsAnalyzing(false)
+                  }
+                } else if (data.type === 'error') {
+                  // Error occurred
+                  assistantContent = data.message || data.error || 'An error occurred'
+                  
+                  // Update stages to show error
+                  if (isAnalyzing) {
+                    setCurrentStages(prev => prev.map(s => 
+                      s.status === 'active' ? { ...s, status: 'error' as const } : s
+                    ))
+                    setIsAnalyzing(false)
+                  }
+                }
+              } catch (parseError) {
+                console.error('Error parsing SSE data:', parseError)
+              }
+            }
+          }
+        }
+
+        // Store session ID
+        if (receivedSessionId) {
+          setSessionId(receivedSessionId)
+        }
+
+        // Add assistant message
+        if (assistantContent) {
+          const assistantMessage: Message = {
+            id: (Date.now() + 1).toString(),
+            role: 'assistant',
+            content: assistantContent,
+            timestamp: new Date(),
+          }
+          setMessages(prev => [...prev, assistantMessage])
+        }
+      } else {
+        // Fallback to non-streaming endpoint
+        const data = await response.json()
         
-        // If we have messages in analysis_result, we could add them too
-        // But for now, just use the summary
-      }
-      
-      const assistantMessage: Message = {
-        id: (Date.now() + 1).toString(),
-        role: 'assistant',
-        content: assistantContent,
-        timestamp: new Date(),
-      }
+        if (data.session_id) {
+          setSessionId(data.session_id)
+        }
 
-      setMessages(prev => [...prev, assistantMessage])
+        if (data.action_taken === 'analysis_triggered') {
+          setIsAnalyzing(true)
+          resetStages()
+        }
+
+        const assistantContent = data.message || data.error || 'Unable to generate response. Please try again.'
+        
+        const assistantMessage: Message = {
+          id: (Date.now() + 1).toString(),
+          role: 'assistant',
+          content: assistantContent,
+          timestamp: new Date(),
+        }
+
+        setMessages(prev => [...prev, assistantMessage])
+        
+        if (data.action_taken === 'analysis_triggered') {
+          setIsAnalyzing(false)
+        }
+      }
     } catch (error) {
       console.error('Chat error:', error)
       const errorMessage: Message = {

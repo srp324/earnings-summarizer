@@ -756,7 +756,7 @@ async def run_earnings_analysis(company_query: str) -> Dict[str, Any]:
     }
 
 
-def stream_earnings_analysis(company_query: str):
+async def stream_earnings_analysis(company_query: str):
     """Stream the earnings analysis process, yielding updates at each step."""
     
     agent = create_earnings_agent()
@@ -778,15 +778,32 @@ def stream_earnings_analysis(company_query: str):
     }
     
     # Stream the agent execution
-    for event in agent.stream(initial_state):
+    final_result = None
+    async for event in agent.astream(initial_state):
         # Yield each step's updates
         for node_name, node_output in event.items():
-            yield {
-                "node": node_name,
-                "stage": node_output.get("current_stage", "processing"),
-                "has_summary": node_output.get("summary") is not None,
+            current_stage = node_output.get("current_stage", "processing")
+            summary = node_output.get("summary")
+            
+            # Map internal stages to user-friendly stages
+            stage_mapping = {
+                "analyzing_query": "analyzing_query",
+                "retrieving_transcript": "retrieving_transcript",
+                "storing_embeddings": "storing_embeddings",
+                "complete": "complete",
             }
-    
-    # Return final result
-    return agent.invoke(initial_state)
+            
+            update = {
+                "node": node_name,
+                "stage": stage_mapping.get(current_stage, current_stage),
+                "has_summary": summary is not None,
+                "summary": summary,
+                "messages": node_output.get("messages", []),
+            }
+            
+            yield update
+            
+            # Keep track of final result
+            if summary:
+                final_result = update
 
