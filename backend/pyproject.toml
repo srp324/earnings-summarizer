@@ -21,7 +21,6 @@ dependencies = [
     "ddgs>=4.4.3",
     "playwright>=1.41.2",
     "beautifulsoup4>=4.12.3",
-    "httpx>=0.26.0",
     
     # PDF parsing
     "pypdf>=4.0.1",

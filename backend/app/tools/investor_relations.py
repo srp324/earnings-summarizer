@@ -5,7 +5,6 @@ from pydantic import BaseModel, Field
 from typing import Type, List, Dict, Optional, Tuple
 import logging
 import requests
-import httpx
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 from datetime import datetime
