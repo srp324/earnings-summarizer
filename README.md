@@ -9,10 +9,17 @@ A multi-agent AI application that automatically analyzes and summarizes stock ea
 
 ## ✨ Features
 
+### 🤖 Conversational AI Interface
+- **Natural Conversations**: Ask follow-up questions and have multi-turn conversations
+- **Intelligent Intent Recognition**: Automatically distinguishes between new analysis requests and follow-up questions
+- **Session-Based Context**: Maintains conversation history and analysis results across interactions
+- **Smart Routing**: Seamlessly switches between analysis mode and chat mode based on your intent
+
+### 📈 Earnings Analysis
 - **Natural Language Queries**: Enter a company name or ticker symbol (e.g., "Apple" or "AAPL")
-- **Automatic IR Discovery**: AI agents find the company's investor relations website
-- **Document Extraction**: Automatically extracts links to earnings reports (10-K, 10-Q, etc.)
-- **PDF Parsing**: Parses PDF earnings reports with table extraction
+- **Web Scraping Integration**: Retrieves earnings call transcripts by scraping discountingcashflows.com
+- **Historical Data**: Access to earnings transcripts with comprehensive historical coverage
+- **No API Keys Required**: Works directly by scraping publicly available transcript pages
 - **Comprehensive Summaries**: Generates detailed summaries covering:
   - Financial highlights (revenue, EPS, margins)
   - Business segment performance
@@ -22,33 +29,65 @@ A multi-agent AI application that automatically analyzes and summarizes stock ea
 
 ## 🏗️ Architecture
 
+The application uses a **conversational AI architecture** with intelligent routing:
+
 ```
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│   React UI      │────▶│   FastAPI       │────▶│   PostgreSQL    │
-│   (Chat)        │◀────│   Backend       │◀────│   + pgvector    │
-└─────────────────┘     └────────┬────────┘     └─────────────────┘
-                                 │
-                    ┌────────────┼────────────┐
-                    │            │            │
-              ┌─────▼────┐ ┌─────▼────┐ ┌─────▼────┐
-              │  Query   │ │   IR     │ │ Document │
-              │ Analyzer │ │  Finder  │ │  Parser  │
-              │  Agent   │ │  Agent   │ │  Agent   │
-              └──────────┘ └──────────┘ └──────────┘
-                                │
-                          ┌─────▼────┐
-                          │Summarizer│
-                          │  Agent   │
-                          └──────────┘
+┌─────────────────┐     ┌─────────────────────────────┐     ┌─────────────────┐
+│   React UI      │────▶│   FastAPI Backend           │────▶│   PostgreSQL    │
+│   (Chat)        │◀────│   /api/v1/chat             │◀────│   + pgvector    │
+└─────────────────┘     └────────────┬────────────────┘     └─────────────────┘
+                                     │
+                        ┌────────────▼─────────────┐
+                        │  Conversation Router     │
+                        │  (Intent Classification) │
+                        └────────────┬─────────────┘
+                                     │
+                        ┌────────────┴────────────┐
+                        │                         │
+                  ┌─────▼──────┐          ┌──────▼─────┐
+                  │  Analysis  │          │    Chat    │
+                  │   Agent    │          │   Agent    │
+                  │(Web Scrape)│          │ (Context)  │
+                  └─────┬──────┘          └────────────┘
+                        │
+         ┌──────────────┼──────────────┐
+         │              │              │
+   ┌─────▼────┐   ┌─────▼────────┐  ┌─────▼────┐
+   │  Query   │   │  Transcript  │  │Summarizer│
+   │ Analyzer │   │  Retriever   │  └──────────┘
+   └──────────┘   └──────────────┘
+                        │
+            (discountingcashflows.com)
 ```
+
+### Conversational Flow
+
+The system intelligently routes user input:
+
+1. **Intent Classification**: Determines if input is a new analysis or follow-up question
+2. **Route Decision**:
+   - **New Analysis** → Triggers multi-agent earnings pipeline (see below)
+   - **Follow-Up Question** → Answers from existing analysis using chat agent
+   - **General Chat** → Conversational responses about system capabilities
+3. **Session Management**: Maintains conversation history and context
 
 ### Multi-Agent Flow (LangGraph)
 
-1. **Query Analyzer Agent**: Understands user input, identifies company/ticker
-2. **IR Finder Agent**: Searches for and validates investor relations websites
-3. **Document Extractor Agent**: Finds links to earnings reports on IR pages
-4. **Document Parser Agent**: Downloads and parses PDF/HTML earnings documents
-5. **Summarizer Agent**: Generates comprehensive financial summaries
+When a new analysis is triggered:
+
+1. **Query Analyzer Agent**: Identifies ticker symbol and lists available transcripts by scraping discountingcashflows.com
+2. **Transcript Retriever Agent**: Retrieves the full earnings call transcript by scraping the transcript page
+3. **Summarizer Agent**: Generates comprehensive financial summaries from the transcript
+
+For detailed architecture documentation, see [ARCHITECTURE.md](./ARCHITECTURE.md).
+
+## 🎯 Recent Updates
+
+**Web Scraping Integration** - The application now retrieves earnings transcripts by scraping discountingcashflows.com. This approach provides:
+- ✅ No API keys required
+- ✅ Direct access to publicly available transcripts
+- ✅ Comprehensive historical transcript coverage
+- ✅ BeautifulSoup-based HTML parsing for reliable extraction
 
 ## 🚀 Getting Started
 
@@ -58,7 +97,7 @@ A multi-agent AI application that automatically analyzes and summarizes stock ea
 - [uv](https://github.com/astral-sh/uv) (Python package manager)
 - Node.js 18+
 - Docker & Docker Compose (recommended)
-- OpenAI API key
+- OpenAI API key (required)
 
 ### Option 1: Docker (Recommended)
 
@@ -67,7 +106,7 @@ A multi-agent AI application that automatically analyzes and summarizes stock ea
    cd earnings-summarizer
    
    # Create environment file
-   echo "OPENAI_API_KEY=your-api-key-here" > .env
+   echo "OPENAI_API_KEY=your-openai-key-here" > .env
    ```
 
 2. **Start all services:**
@@ -124,9 +163,6 @@ source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 uv pip install -r requirements.txt
 # Or use: uv sync (if using pyproject.toml)
 
-# Install Playwright browsers (for web scraping)
-playwright install chromium
-
 # Create .env file
 cp .env.example .env
 # Edit .env and add your OPENAI_API_KEY
@@ -162,7 +198,54 @@ docker run -d \
 
 ## 📖 API Reference
 
-### Analyze Earnings
+### Chat (Recommended - Conversational Interface)
+
+```http
+POST /api/v1/chat
+Content-Type: application/json
+
+{
+  "message": "Apple",
+  "session_id": null  // or existing session_id for continuity
+}
+```
+
+**Response:**
+```json
+{
+  "session_id": "uuid",
+  "message": "## Financial Highlights\n\n...",
+  "action_taken": "analysis_triggered",  // or "chat"
+  "intent": "new_analysis",
+  "analysis_result": {
+    "session_id": "uuid",
+    "company_query": "Apple",
+    "status": "complete",
+    "summary": "...",
+    "messages": [...]
+  }
+}
+```
+
+**Example Conversation:**
+```bash
+# First request - triggers analysis
+POST /api/v1/chat
+{ "message": "NVDA", "session_id": null }
+→ Returns analysis + session_id
+
+# Follow-up question - uses existing analysis
+POST /api/v1/chat
+{ "message": "Tell me about business segments", "session_id": "abc-123" }
+→ Returns chat response based on previous analysis
+
+# Another follow-up
+POST /api/v1/chat
+{ "message": "yes", "session_id": "abc-123" }
+→ Intelligently handles affirmative responses
+```
+
+### Analyze Earnings (Legacy - Direct Analysis)
 
 ```http
 POST /api/v1/analyze
@@ -218,33 +301,27 @@ GET /api/v1/sessions/{session_id}
 |----------|-------------|---------|
 | `OPENAI_API_KEY` | OpenAI API key (required) | - |
 | `DATABASE_URL` | PostgreSQL connection string | `postgresql+asyncpg://postgres:postgres@localhost:5432/earnings_db` |
-| `LLM_MODEL` | OpenAI model to use | `gpt-4o` |
+| `LLM_MODEL` | OpenAI model to use | `gpt-4.1-mini` |
 | `LLM_TEMPERATURE` | LLM temperature | `0.1` |
 | `HOST` | Backend host | `0.0.0.0` |
 | `PORT` | Backend port | `8000` |
 
 ## ⚠️ Known Limitations & Complications
 
-### 1. PDF Parsing Challenges
-- Some PDFs contain scanned images instead of text
-- Complex table layouts may not parse correctly
-- Very large documents (100+ pages) are truncated
+### 1. Web Scraping Considerations
+- Website structure changes may break the scraper
+- Rate limiting: Be respectful of discountingcashflows.com - implement delays between requests for production use
+- Network dependency: Requires stable internet connection to access transcript pages
 
-### 2. Dynamic Website Content
-- Some IR sites load content via JavaScript
-- May require Playwright for full rendering (currently uses HTTP requests)
+### 2. Transcript Availability
+- Not all companies may have transcripts available on discountingcashflows.com
+- Some transcripts may be delayed or unavailable for certain periods
+- Try alternative ticker symbols if a company isn't found
+- Transcript page structure may vary, requiring selector updates
 
-### 3. Rate Limiting
-- Search APIs and IR sites may rate-limit requests
-- Implement delays between requests for production use
-
-### 4. Document Discovery
-- Companies use different naming conventions (10-K, Annual Report, etc.)
-- Some sites require authentication or are behind paywalls
-
-### 5. LLM Context Limits
-- Very long documents are chunked/truncated
-- Consider implementing RAG with pgvector for large documents
+### 3. LLM Context Limits
+- Very long transcripts may be truncated to fit within context limits
+- Consider implementing RAG with pgvector for handling very long documents
 
 ## 📁 Project Structure
 
@@ -253,27 +330,28 @@ earnings-summarizer/
 ├── backend/
 │   ├── app/
 │   │   ├── agents/           # LangGraph multi-agent system
-│   │   │   └── earnings_agent.py
+│   │   │   ├── earnings_agent.py      # Earnings analysis pipeline
+│   │   │   └── conversation_router.py # Intent classification & routing
 │   │   ├── api/              # FastAPI routes
-│   │   │   └── routes.py
+│   │   │   └── routes.py     # /chat, /analyze endpoints
 │   │   ├── tools/            # LangChain tools
-│   │   │   ├── web_search.py
-│   │   │   ├── document_parser.py
-│   │   │   └── investor_relations.py
+│   │   │   └── investor_relations.py  # Web scraping for earnings transcripts from discountingcashflows.com
 │   │   ├── config.py         # Settings
 │   │   ├── database.py       # SQLAlchemy + pgvector
+│   │   ├── session_manager.py # Conversation session management
 │   │   ├── schemas.py        # Pydantic models
 │   │   └── main.py           # FastAPI app
 │   ├── requirements.txt
 │   └── Dockerfile
 ├── frontend/
 │   ├── src/
-│   │   ├── App.tsx           # Main React component
+│   │   ├── App.tsx           # Main React component (conversational UI)
 │   │   ├── main.tsx
 │   │   └── index.css         # Tailwind styles
 │   ├── package.json
 │   └── Dockerfile
 ├── docker-compose.yml
+├── ARCHITECTURE.md           # Detailed architecture documentation
 └── README.md
 ```
 
