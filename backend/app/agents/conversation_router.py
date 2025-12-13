@@ -161,8 +161,10 @@ Return your classification with confidence and reasoning."""),
         # Determine action
         if classification.intent == "new_analysis":
             action = "analyze"
+            # Use full user_input to preserve fiscal year/quarter information
+            # The agent will extract the company name and fiscal details separately
             context = {
-                "company_query": classification.extracted_company or user_input,
+                "company_query": user_input,  # Use full input to preserve "NVDA Q2 FY 2025" format
                 "is_new_analysis": True
             }
         elif classification.intent == "follow_up_question":
