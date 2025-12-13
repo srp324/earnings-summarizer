@@ -161,10 +161,64 @@ Return your classification with confidence and reasoning."""),
         # Determine action
         if classification.intent == "new_analysis":
             action = "analyze"
-            # Use full user_input to preserve fiscal year/quarter information
+            
+            # Build complete company query from context
+            company_query = user_input
+            
+            # If extracted_company is provided and different from user_input, use it
+            # This handles cases where LLM combined context (e.g., "NVDA 2022 Q1" from "Q1" + history)
+            if classification.extracted_company and classification.extracted_company != user_input:
+                company_query = classification.extracted_company
+            else:
+                # Fallback: Try to extract context from conversation history if current input is incomplete
+                # Check if user_input looks incomplete (just quarter, just year, etc.)
+                user_lower = user_input.strip().upper()
+                
+                # Patterns that suggest incomplete input
+                is_just_quarter = bool(re.match(r'^Q[1-4]$', user_lower))
+                is_just_year = bool(re.match(r'^(20\d{2}|FY\s*20\d{2})$', user_lower))
+                is_quarter_year = bool(re.match(r'^Q[1-4]\s+(20\d{2}|FY\s*20\d{2})$', user_lower))
+                
+                if is_just_quarter or is_just_year or is_quarter_year:
+                    # Look for company/ticker and year in previous user messages
+                    ticker = None
+                    year = None
+                    
+                    for msg in reversed(conversation_history):
+                        if msg.get("role") == "user":
+                            prev_content = msg.get("content", "").strip()
+                            # Extract ticker (1-5 uppercase letters, common ticker pattern)
+                            if not ticker:
+                                ticker_match = re.search(r'\b([A-Z]{1,5})\b', prev_content.upper())
+                                if ticker_match:
+                                    ticker = ticker_match.group(1)
+                            
+                            # Extract year
+                            if not year:
+                                year_match = re.search(r'(?:FY\s*)?(20\d{2})', prev_content)
+                                if year_match:
+                                    year = year_match.group(1)
+                            
+                            # If we found both, we can build the query
+                            if ticker and year:
+                                break
+                    
+                    # Build complete query if we found missing pieces
+                    if ticker:
+                        if is_just_quarter and year:
+                            company_query = f"{ticker} {year} {user_input}"
+                        elif is_just_quarter:
+                            company_query = f"{ticker} {user_input}"
+                        elif is_just_year:
+                            company_query = f"{ticker} {user_input}"
+                        elif is_quarter_year:
+                            # User provided quarter and year, just need ticker
+                            company_query = f"{ticker} {user_input}"
+            
+            # Use full company_query to preserve fiscal year/quarter information
             # The agent will extract the company name and fiscal details separately
             context = {
-                "company_query": user_input,  # Use full input to preserve "NVDA Q2 FY 2025" format
+                "company_query": company_query,  # Use full input to preserve "NVDA 2022 Q1" format
                 "is_new_analysis": True
             }
         elif classification.intent == "follow_up_question":

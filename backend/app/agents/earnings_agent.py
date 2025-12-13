@@ -123,11 +123,19 @@ def create_earnings_agent():
             
             # If no combined match, try separate patterns
             if not requested_fiscal_year or not requested_quarter:
+                # Try patterns with FY prefix first
                 year_match = re.search(r'FY?\s*(\d{4})', user_query, re.I)
-                quarter_match = re.search(r'Q\s*([1-4])', user_query, re.I)
                 if year_match:
                     requested_fiscal_year = year_match.group(1)
                     logger.info(f"Extracted fiscal year: {requested_fiscal_year}")
+                else:
+                    # Try standalone 4-digit year (likely fiscal year if between 2000-2099)
+                    standalone_year_match = re.search(r'\b(20\d{2})\b', user_query)
+                    if standalone_year_match:
+                        requested_fiscal_year = standalone_year_match.group(1)
+                        logger.info(f"Extracted standalone fiscal year: {requested_fiscal_year}")
+                
+                quarter_match = re.search(r'Q\s*([1-4])', user_query, re.I)
                 if quarter_match:
                     requested_quarter = quarter_match.group(1)
                     logger.info(f"Extracted quarter: {requested_quarter}")
@@ -278,6 +286,55 @@ Then immediately use list_earnings_transcripts to get the available earnings tra
         requested_quarter = state.get("requested_quarter")
         
         logger.info(f"transcript_retriever: requested_fiscal_year={requested_fiscal_year}, requested_quarter={requested_quarter}")
+        
+        # Check if we have a fiscal year but no quarter - ask user to specify quarter
+        if requested_fiscal_year and not requested_quarter:
+            try:
+                # Extract ticker symbol from state or try to extract from company_query
+                ticker_symbol = state.get("ticker_symbol")
+                company_name = state.get("company_name")
+                
+                # If ticker not in state, try to extract from company_query
+                if not ticker_symbol:
+                    company_query = state.get("company_query", "")
+                    # Try to find a ticker-like pattern (uppercase letters, 1-5 chars)
+                    ticker_match = re.search(r'\b([A-Z]{1,5})\b', company_query)
+                    if ticker_match:
+                        ticker_symbol = ticker_match.group(1)
+                
+                # Use ticker or company name, fallback to generic
+                display_name = company_name or ticker_symbol or "the company"
+                
+                if ticker_symbol:
+                    clarification_message = f"""I found that you're looking for {display_name}'s earnings report for fiscal year {requested_fiscal_year}, but I need you to specify which quarter (Q1, Q2, Q3, or Q4) you'd like me to analyze.
+
+Please provide the quarter, for example:
+- "{ticker_symbol} {requested_fiscal_year} Q1"
+- "{ticker_symbol} {requested_fiscal_year} Q2"
+- "{ticker_symbol} {requested_fiscal_year} Q3"
+- "{ticker_symbol} {requested_fiscal_year} Q4"
+
+Or you can simply say "Q1", "Q2", "Q3", or "Q4" and I'll use the fiscal year {requested_fiscal_year}."""
+                else:
+                    clarification_message = f"""I found that you're looking for {display_name}'s earnings report for fiscal year {requested_fiscal_year}, but I need you to specify which quarter (Q1, Q2, Q3, or Q4) you'd like me to analyze.
+
+Please provide the quarter, for example:
+- "{requested_fiscal_year} Q1"
+- "{requested_fiscal_year} Q2"
+- "{requested_fiscal_year} Q3"
+- "{requested_fiscal_year} Q4"
+
+Or you can simply say "Q1", "Q2", "Q3", or "Q4" and I'll use the fiscal year {requested_fiscal_year}."""
+                
+                logger.info(f"Returning clarification message for fiscal year {requested_fiscal_year} without quarter")
+                return {
+                    "messages": [AIMessage(content=clarification_message)],
+                    "current_stage": "complete",  # End here to return the clarification
+                    "summary": clarification_message,  # Set as summary so it's returned to user
+                }
+            except Exception as e:
+                logger.error(f"Error generating clarification message: {e}", exc_info=True)
+                # Fall through to normal processing if clarification fails
         
         # Build system prompt with explicit values if available
         if requested_fiscal_year and requested_quarter:
