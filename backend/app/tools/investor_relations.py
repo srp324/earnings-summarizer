@@ -247,7 +247,7 @@ def _get_most_recent_transcript(symbol: str) -> Tuple[Optional[str], Optional[st
                                     'href': href,
                                     'order': li_idx * 100 + link_idx  # Preserve order (lower = earlier in HTML = more recent)
                                 })
-                                logger.info(f"Found transcript: FY{year} Q{quarter} from URL: {href} (order: {li_idx * 100 + link_idx})")
+                                #logger.info(f"Found transcript: FY{year} Q{quarter} from URL: {href} (order: {li_idx * 100 + link_idx})")
                         else:
                             # Extract quarter from text (e.g., "Q3", "Q 3")
                             quarter_match = re.search(r'Q\s*([1-4])', text, re.I)
@@ -869,11 +869,8 @@ class TranscriptTool(BaseTool):
                                     logger.info(f"  P-4 div {i+1}: length={text_length} chars")
                                     logger.info(f"  P-4 div {i+1} PREVIEW: {text[:200]}...")
                                     
-                                    if text and text_length > 20:
+                                    if text:
                                         transcript_parts.append(text.strip())
-                                        logger.info(f"  -> Added to transcript_parts (total parts: {len(transcript_parts)})")
-                                    else:
-                                        logger.warning(f"  -> Skipped (too short: {text_length} chars)")
                                 else:
                                     logger.warning(f"  -> Second child div doesn't have p-4 class: '{class_str}'")
                             else:
@@ -987,55 +984,6 @@ class TranscriptTool(BaseTool):
                     # Parse and extract content
                     rendered_soup = BeautifulSoup(rendered_html, 'html.parser')
                     
-                    # Debug: Check if the transcript text exists and find its element
-                    search_text = "and I will be your conference operator today"
-                    logger.info(f"Searching for text: '{search_text}' in rendered HTML")
-                    
-                    if search_text in rendered_html:
-                        logger.info(f"Text '{search_text}' FOUND in rendered HTML")
-                        # Find the element containing this text
-                        all_elements = rendered_soup.find_all(string=lambda text: text and search_text in text)
-                        if all_elements:
-                            logger.info(f"Found {len(all_elements)} text node(s) containing the search text")
-                            for i, text_node in enumerate(all_elements):
-                                # Get the parent element
-                                parent = text_node.parent
-                                if parent:
-                                    parent_tag = parent.name if hasattr(parent, 'name') else 'unknown'
-                                    parent_classes = parent.get('class', [])
-                                    class_str = ' '.join(parent_classes) if isinstance(parent_classes, list) else str(parent_classes)
-                                    parent_id = parent.get('id', '')
-                                    
-                                    logger.info(f"  Text node {i+1}:")
-                                    logger.info(f"    Parent tag: {parent_tag}")
-                                    logger.info(f"    Parent classes: '{class_str}'")
-                                    logger.info(f"    Parent id: '{parent_id}'")
-                                    logger.info(f"    Parent HTML preview: {str(parent)[:500]}...")
-                                    
-                                    # Also check ancestors to see the full hierarchy
-                                    ancestors = []
-                                    current = parent
-                                    while current and hasattr(current, 'parent') and current.parent:
-                                        current = current.parent
-                                        if hasattr(current, 'name') and current.name:
-                                            ancestor_classes = current.get('class', [])
-                                            ancestor_class_str = ' '.join(ancestor_classes) if isinstance(ancestor_classes, list) else str(ancestor_classes)
-                                            ancestors.append(f"{current.name}.{ancestor_class_str}")
-                                    if ancestors:
-                                        logger.info(f"    Ancestor hierarchy: {' > '.join(ancestors)}")
-                        else:
-                            # Try finding by searching in element text
-                            matching_elements = [elem for elem in rendered_soup.find_all() 
-                                               if elem.string and search_text in elem.string]
-                            if matching_elements:
-                                logger.info(f"Found {len(matching_elements)} element(s) with matching text")
-                                for i, elem in enumerate(matching_elements[:5]):
-                                    classes = elem.get('class', [])
-                                    class_str = ' '.join(classes) if isinstance(classes, list) else str(classes)
-                                    logger.info(f"  Element {i+1}: tag={elem.name}, classes='{class_str}', id='{elem.get('id', '')}'")
-                    else:
-                        logger.warning(f"Text '{search_text}' NOT FOUND in rendered HTML")
-                    
                     # Extract transcript content BEFORE removing unwanted elements
                     # This is critical because the cleanup process may remove parent elements
                     def match_flex_my5_classes(class_attr):
@@ -1105,11 +1053,8 @@ class TranscriptTool(BaseTool):
                                 text = second_child.get_text(separator=' ', strip=True)
                                 text_length = len(text.strip()) if text else 0
                                 
-                                if text and text_length > 20:
+                                if text:
                                     transcript_parts.append(text.strip())
-                                    logger.info(f"  -> Added to transcript_parts (total parts: {len(transcript_parts)})")
-                                else:
-                                    logger.warning(f"  -> Skipped (too short: {text_length} chars)")
                             else:
                                 logger.warning(f"  -> Second child div doesn't have p-4 class: '{class_str}'")
                         else:
