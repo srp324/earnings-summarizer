@@ -276,13 +276,27 @@ async def chat_stream(
                 # Trigger new earnings analysis with streaming
                 company_query = context.get("company_query", request.message)
                 
-                # Create database session record
-                db_session = SearchSession(
-                    session_id=session.session_id,
-                    company_query=company_query,
-                    status="searching",
+                # Check if database session already exists
+                result = await db.execute(
+                    select(SearchSession).where(SearchSession.session_id == session.session_id)
                 )
-                db.add(db_session)
+                db_session = result.scalar_one_or_none()
+                
+                if db_session:
+                    # Update existing session
+                    db_session.company_query = company_query
+                    db_session.status = "searching"
+                    db_session.summary = None  # Clear previous summary
+                    db_session.updated_at = datetime.utcnow()
+                else:
+                    # Create new database session record
+                    db_session = SearchSession(
+                        session_id=session.session_id,
+                        company_query=company_query,
+                        status="searching",
+                    )
+                    db.add(db_session)
+                
                 await db.commit()
                 
                 # Map agent stages to frontend stages
@@ -481,13 +495,27 @@ async def chat(
             # Trigger new earnings analysis
             company_query = context.get("company_query", request.message)
             
-            # Create database session record
-            db_session = SearchSession(
-                session_id=session.session_id,
-                company_query=company_query,
-                status="searching",
+            # Check if database session already exists
+            result = await db.execute(
+                select(SearchSession).where(SearchSession.session_id == session.session_id)
             )
-            db.add(db_session)
+            db_session = result.scalar_one_or_none()
+            
+            if db_session:
+                # Update existing session
+                db_session.company_query = company_query
+                db_session.status = "searching"
+                db_session.summary = None  # Clear previous summary
+                db_session.updated_at = datetime.utcnow()
+            else:
+                # Create new database session record
+                db_session = SearchSession(
+                    session_id=session.session_id,
+                    company_query=company_query,
+                    status="searching",
+                )
+                db.add(db_session)
+            
             await db.commit()
             
             # Run analysis
