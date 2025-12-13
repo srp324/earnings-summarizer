@@ -2,7 +2,7 @@
 
 from langchain.tools import BaseTool
 from pydantic import BaseModel, Field
-from typing import Type, List, Dict, Optional
+from typing import Type, List, Dict, Optional, Tuple
 import logging
 import requests
 import httpx
@@ -191,8 +191,134 @@ class TranscriptListTool(BaseTool):
 class TranscriptInput(BaseModel):
     """Input schema for retrieving a specific earnings transcript."""
     symbol: str = Field(description="Stock ticker symbol (e.g., 'AAPL')")
-    fiscal_year: str = Field(description="Fiscal year (e.g., '2025' or '2024')")
-    quarter: str = Field(description="Quarter number (1, 2, 3, or 4)")
+    fiscal_year: Optional[str] = Field(default=None, description="Fiscal year (e.g., '2025' or '2024'). If not provided, will use the most recent transcript.")
+    quarter: Optional[str] = Field(default=None, description="Quarter number (1, 2, 3, or 4). If not provided, will use the most recent transcript.")
+
+
+def _get_most_recent_transcript(symbol: str) -> Tuple[Optional[str], Optional[str]]:
+    """Helper function to get the most recent transcript's fiscal_year and quarter."""
+    try:
+        symbol_upper = symbol.upper().strip()
+        list_url = f"{DCF_BASE_URL}/company/{symbol_upper}/transcripts/"
+        
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        }
+        
+        response = requests.get(list_url, headers=headers, timeout=30)
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Look for the transcripts list structure: ul.transcripts-list
+        transcripts = []
+        
+        # Method 1: Parse the transcripts-list structure (ul with class transcripts-list)
+        transcript_list = soup.find('ul', class_=re.compile(r'transcripts-list', re.I))
+        if transcript_list:
+            current_year = None
+            # Iterate through li elements in order (most recent should be first)
+            for li_idx, li in enumerate(transcript_list.find_all('li', recursive=False)):
+                # Check for h2 with fiscal year (e.g., "FY 2026")
+                h2 = li.find('h2', class_=re.compile(r'menu-title', re.I))
+                if h2:
+                    year_match = re.search(r'FY\s*(\d{4})', h2.get_text(strip=True), re.I)
+                    if year_match:
+                        current_year = year_match.group(1)
+                        logger.info(f"Found fiscal year: {current_year} (at position {li_idx})")
+                
+                # Look for links within this li that contain quarter info
+                # The first link in the first fiscal year section is likely the most recent
+                if current_year:
+                    links = li.find_all('a', href=True)
+                    for link_idx, link in enumerate(links):
+                        href = link.get('href', '')
+                        text = link.get_text(strip=True)
+                        
+                        # Extract quarter from URL: /transcripts/{year}/{quarter}/
+                        url_match = re.search(r'/transcripts/(\d{4})/(\d{1})/', href)
+                        if url_match:
+                            year = url_match.group(1)
+                            quarter = url_match.group(2)
+                            if year == current_year:  # Only add if it matches the current fiscal year section
+                                transcripts.append({
+                                    'year': year,
+                                    'quarter': quarter,
+                                    'href': href,
+                                    'order': li_idx * 100 + link_idx  # Preserve order (lower = earlier in HTML = more recent)
+                                })
+                                logger.info(f"Found transcript: FY{year} Q{quarter} from URL: {href} (order: {li_idx * 100 + link_idx})")
+                        else:
+                            # Extract quarter from text (e.g., "Q3", "Q 3")
+                            quarter_match = re.search(r'Q\s*([1-4])', text, re.I)
+                            if quarter_match:
+                                quarter = quarter_match.group(1)
+                                transcripts.append({
+                                    'year': current_year,
+                                    'quarter': quarter,
+                                    'href': href,
+                                    'order': li_idx * 100 + link_idx
+                                })
+                                logger.info(f"Found transcript: FY{current_year} Q{quarter} from text: {text} (order: {li_idx * 100 + link_idx})")
+        
+        # Method 2: Fallback - find all links with transcript URLs
+        if not transcripts:
+            for idx, link in enumerate(soup.find_all('a', href=True)):
+                href = link.get('href', '')
+                # Extract from URL pattern: /company/{symbol}/transcripts/{year}/{quarter}/
+                url_match = re.search(r'/transcripts/(\d{4})/(\d{1})/', href)
+                if url_match:
+                    year = url_match.group(1)
+                    quarter = url_match.group(2)
+                    transcripts.append({
+                        'year': year,
+                        'quarter': quarter,
+                        'href': href,
+                        'order': idx  # Preserve order from HTML
+                    })
+        
+        # Remove duplicates
+        seen = set()
+        unique_transcripts = []
+        for t in transcripts:
+            key = (t.get('year'), t.get('quarter'))
+            if key not in seen and key != (None, None):
+                seen.add(key)
+                unique_transcripts.append(t)
+        
+        if not unique_transcripts:
+            logger.warning("No transcripts found in the expected structure")
+            return None, None
+        
+        # Sort by year DESC then quarter DESC (most recent first)
+        # Higher year = more recent, and within same year, higher quarter = more recent
+        # Also consider HTML order as a tiebreaker (lower order number = appeared earlier = more recent)
+        def sort_key(t):
+            year = int(t.get('year', 0)) if t.get('year') and t.get('year').isdigit() else 0
+            quarter = int(t.get('quarter', 0)) if t.get('quarter') and t.get('quarter').isdigit() else 0
+            order = t.get('order', 999999)  # Default to high number if no order
+            return (-year, -quarter, order)  # Negative for descending order on year/quarter, ascending on order
+        
+        unique_transcripts.sort(key=sort_key)
+        
+        # Log all transcripts found for debugging
+        logger.info(f"Found {len(unique_transcripts)} unique transcripts:")
+        for t in unique_transcripts[:5]:  # Log first 5
+            logger.info(f"  - FY{t.get('year')} Q{t.get('quarter')}")
+        
+        # Return ONLY the most recent one (first after sorting)
+        if unique_transcripts:
+            most_recent = unique_transcripts[0]
+            logger.info(f"Most recent transcript selected: FY{most_recent.get('year')} Q{most_recent.get('quarter')}")
+            return most_recent.get('year'), most_recent.get('quarter')
+        
+        return None, None
+        
+    except Exception as e:
+        logger.error(f"Error getting most recent transcript: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return None, None
 
 
 class TranscriptTool(BaseTool):
@@ -201,19 +327,65 @@ class TranscriptTool(BaseTool):
     name: str = "get_earnings_transcript"
     description: str = """
     Retrieve the full content of an earnings call transcript using symbol, fiscal year, and quarter.
-    First use list_earnings_transcripts to get available transcripts with their fiscal years and quarters.
-    Input should be:
-    - symbol: Stock ticker (e.g., "NVDA")
-    - fiscal_year: Fiscal year as string (e.g., "2025")
-    - quarter: Quarter number as string "1", "2", "3", or "4"
+    If fiscal_year or quarter is not provided, will automatically use the most recent available transcript.
+    
+    IMPORTANT: When the user specifies a fiscal year and quarter (e.g., "FY2025Q2", "FY 2025 Q2", "2025 Q2"), 
+    you MUST extract and pass them as separate parameters:
+    - fiscal_year: Extract the year (e.g., "2025" from "FY2025Q2")
+    - quarter: Extract the quarter number (e.g., "2" from "FY2025Q2")
+    
+    Input parameters:
+    - symbol: Stock ticker (e.g., "NVDA", "AAPL", "MSFT")
+    - fiscal_year: (Optional) Fiscal year as string (e.g., "2025", "2024"). Extract from formats like "FY2025", "2025", "FY 2025". If not provided, uses most recent.
+    - quarter: (Optional) Quarter number as string "1", "2", "3", or "4". Extract from formats like "Q2", "Q 2", "2". If not provided, uses most recent.
+    
     Returns the complete earnings call transcript with all speakers and content.
     """
     args_schema: Type[BaseModel] = TranscriptInput
     
-    def _run(self, symbol: str, fiscal_year: str, quarter: str) -> str:
+    def _run(self, symbol: str, fiscal_year: Optional[str] = None, quarter: Optional[str] = None) -> str:
         """Retrieve full earnings transcript content."""
         try:
             symbol_upper = symbol.upper().strip()
+            
+            # Log what we received
+            logger.info(f"_run received: symbol={symbol_upper}, fiscal_year={fiscal_year}, quarter={quarter}")
+            
+            # Handle string 'None' case - but be careful not to override valid values
+            if fiscal_year:
+                fiscal_year_clean = fiscal_year.strip()
+                if fiscal_year_clean.lower() in ('none', 'null', ''):
+                    fiscal_year = None
+                else:
+                    fiscal_year = fiscal_year_clean
+            if quarter:
+                quarter_clean = quarter.strip()
+                if quarter_clean.lower() in ('none', 'null', ''):
+                    quarter = None
+                else:
+                    quarter = quarter_clean
+            
+            # Try to extract fiscal_year and quarter from combined formats like "FY2025Q2", "FY 2025 Q2", "2025Q2"
+            # This handles cases where the LLM might pass them in a combined format
+            if fiscal_year and not quarter:
+                # Check if fiscal_year contains both year and quarter (e.g., "FY2025Q2", "2025Q2")
+                combined_match = re.search(r'FY?\s*(\d{4})\s*Q\s*([1-4])', fiscal_year, re.I)
+                if combined_match:
+                    fiscal_year = combined_match.group(1)
+                    quarter = combined_match.group(2)
+                    logger.info(f"Extracted from combined format: FY{fiscal_year} Q{quarter}")
+            
+            # If fiscal_year or quarter is still missing, get the most recent transcript
+            if not fiscal_year or not quarter:
+                logger.info(f"fiscal_year or quarter not provided for {symbol_upper}, fetching most recent transcript...")
+                most_recent_year, most_recent_quarter = _get_most_recent_transcript(symbol_upper)
+                if most_recent_year and most_recent_quarter:
+                    fiscal_year = fiscal_year or most_recent_year
+                    quarter = quarter or most_recent_quarter
+                    logger.info(f"Using most recent transcript: FY{fiscal_year} Q{quarter}")
+                else:
+                    return f"**Error:** Could not find any available transcripts for {symbol_upper}. Please use list_earnings_transcripts to see available transcripts."
+            
             logger.info(f"Fetching earnings transcript for {symbol_upper} FY{fiscal_year} Q{quarter} from discountingcashflows.com")
             
             # First, try to get the transcripts list page to find the specific transcript link
@@ -526,11 +698,78 @@ class TranscriptTool(BaseTool):
             logger.error(f"Error parsing transcript: {str(e)}")
             return f"**Error retrieving earnings transcript**\n\n{str(e)}\n\nPlease ensure the symbol, fiscal year, and quarter are correct."
     
-    async def _arun(self, symbol: str, fiscal_year: str, quarter: str) -> str:
+    async def _arun(self, *args, **kwargs) -> str:
         """Async execution with Playwright support for JavaScript-rendered pages."""
-        logger.info(f"=== _arun called for {symbol} FY{fiscal_year} Q{quarter} ===")
+        # LangChain BaseTool should pass arguments the same way as _run
+        # But handle both cases: positional args and kwargs
+        symbol = None
+        fiscal_year = None
+        quarter = None
+        
+        # Try to get from positional args first (matching _run signature)
+        if len(args) >= 3:
+            symbol, fiscal_year, quarter = args[0], args[1], args[2]
+        elif len(args) == 1 and isinstance(args[0], dict):
+            # LangChain might pass tool input as a single dict argument
+            tool_input = args[0]
+            symbol = tool_input.get('symbol')
+            fiscal_year = tool_input.get('fiscal_year')
+            quarter = tool_input.get('quarter')
+        
+        # Also check kwargs
+        symbol = symbol or kwargs.get('symbol')
+        fiscal_year = fiscal_year or kwargs.get('fiscal_year')
+        quarter = quarter or kwargs.get('quarter')
+        
+        # Log what we received for debugging
+        logger.info(f"_arun received: args={args}, kwargs={kwargs}, extracted: symbol={symbol}, fiscal_year={fiscal_year}, quarter={quarter}")
+        
+        # Validate we have symbol
+        if not symbol:
+            error_msg = f"Missing required argument: symbol. args={args}, kwargs={kwargs}"
+            logger.error(error_msg)
+            return f"**Error:** Missing required argument: symbol. Please provide a stock ticker symbol."
+        
+        symbol_upper = symbol.upper().strip()
+        
+        # Handle string 'None' case - but be careful not to override valid values
+        if fiscal_year:
+            fiscal_year_clean = fiscal_year.strip()
+            if fiscal_year_clean.lower() in ('none', 'null', ''):
+                fiscal_year = None
+            else:
+                fiscal_year = fiscal_year_clean
+        if quarter:
+            quarter_clean = quarter.strip()
+            if quarter_clean.lower() in ('none', 'null', ''):
+                quarter = None
+            else:
+                quarter = quarter_clean
+        
+        # Try to extract fiscal_year and quarter from combined formats like "FY2025Q2", "FY 2025 Q2", "2025Q2"
+        # This handles cases where the LLM might pass them in a combined format
+        if fiscal_year and not quarter:
+            # Check if fiscal_year contains both year and quarter (e.g., "FY2025Q2", "2025Q2")
+            combined_match = re.search(r'FY?\s*(\d{4})\s*Q\s*([1-4])', fiscal_year, re.I)
+            if combined_match:
+                fiscal_year = combined_match.group(1)
+                quarter = combined_match.group(2)
+                logger.info(f"Extracted from combined format: FY{fiscal_year} Q{quarter}")
+        
+        # If fiscal_year or quarter is still missing, get the most recent transcript
+        if not fiscal_year or not quarter:
+            logger.info(f"fiscal_year or quarter not provided for {symbol_upper}, fetching most recent transcript...")
+            most_recent_year, most_recent_quarter = _get_most_recent_transcript(symbol_upper)
+            if most_recent_year and most_recent_quarter:
+                fiscal_year = fiscal_year or most_recent_year
+                quarter = quarter or most_recent_quarter
+                logger.info(f"Using most recent transcript: FY{fiscal_year} Q{quarter}")
+            else:
+                return f"**Error:** Could not find any available transcripts for {symbol_upper}. Please use list_earnings_transcripts to see available transcripts."
+        
+        logger.info(f"=== _arun called for {symbol_upper} FY{fiscal_year} Q{quarter} ===")
         # Since discountingcashflows.com uses JavaScript rendering, use Playwright directly
-        logger.info(f"Using async Playwright to fetch transcript for {symbol.upper()} FY{fiscal_year} Q{quarter}")
+        logger.info(f"Using async Playwright to fetch transcript for {symbol_upper} FY{fiscal_year} Q{quarter}")
         
         symbol_upper = symbol.upper().strip()
         fiscal_year_clean = re.sub(r'[^\d]', '', fiscal_year)

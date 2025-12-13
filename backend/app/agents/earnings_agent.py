@@ -9,15 +9,18 @@ Flow:
 
 from typing import TypedDict, Annotated, Sequence, List, Optional, Dict, Any
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage, ToolMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
 import operator
 import json
+import logging
 
 from app.config import get_settings
 from app.tools.investor_relations import TranscriptListTool, TranscriptTool
+
+logger = logging.getLogger(__name__)
 
 
 class EarningsAgentState(TypedDict):
@@ -32,6 +35,9 @@ class EarningsAgentState(TypedDict):
     summary: Optional[str]
     current_stage: str
     error: Optional[str]
+    requested_fiscal_year: Optional[str]  # Fiscal year explicitly requested by user
+    requested_quarter: Optional[str]  # Quarter explicitly requested by user
+    transcript_retrieved: bool  # Flag to prevent multiple transcript retrievals
 
 
 def create_earnings_agent():
@@ -65,6 +71,69 @@ def create_earnings_agent():
     
     def query_analyzer(state: EarningsAgentState) -> Dict[str, Any]:
         """Analyze user query and extract company information."""
+        
+        # Extract fiscal year and quarter from user query if present
+        import re
+        user_query = state.get("company_query", "")
+        
+        # Also check messages if company_query doesn't have it
+        if not user_query and state.get("messages"):
+            for msg in state["messages"]:
+                if hasattr(msg, "content") and isinstance(msg.content, str):
+                    # Extract from the original query, not the formatted message
+                    content = msg.content
+                    # Remove the prefix "Please analyze and summarize the earnings reports for: "
+                    if "Please analyze and summarize" in content:
+                        user_query = content.split(":", 1)[-1].strip()
+                    else:
+                        user_query = content
+                    break
+        
+        requested_fiscal_year = None
+        requested_quarter = None
+        
+        # Try to extract fiscal year and quarter from query
+        if user_query:
+            logger.info(f"Extracting fiscal year and quarter from user query: {user_query}")
+            
+            # Patterns in order of specificity:
+            # 1. Combined formats: FY2025Q2, FY 2025 Q2, 2025 Q2, Q2 2025, Q2 FY 2025, Q2 FY2025, etc.
+            # Use tuples to track which group is year vs quarter
+            combined_patterns = [
+                (r'FY\s*(\d{4})\s*Q\s*([1-4])', True),    # FY 2025 Q2, FY2025Q2 - year is group 1
+                (r'Q\s*([1-4])\s*FY\s*(\d{4})', False),   # Q2 FY 2025, Q2 FY2025 - quarter is group 1, year is group 2
+                (r'(\d{4})\s*Q\s*([1-4])', True),         # 2025 Q2 - year is group 1
+                (r'Q\s*([1-4])\s*(\d{4})', False),        # Q2 2025 - quarter is group 1, year is group 2
+            ]
+            
+            for pattern, year_is_first in combined_patterns:
+                combined_match = re.search(pattern, user_query, re.I)
+                if combined_match:
+                    if year_is_first:
+                        requested_fiscal_year = combined_match.group(1)
+                        requested_quarter = combined_match.group(2)
+                    else:
+                        # Quarter first pattern
+                        requested_quarter = combined_match.group(1)
+                        requested_fiscal_year = combined_match.group(2)
+                    logger.info(f"Extracted from pattern '{pattern}': FY{requested_fiscal_year} Q{requested_quarter}")
+                    break
+            
+            # If no combined match, try separate patterns
+            if not requested_fiscal_year or not requested_quarter:
+                year_match = re.search(r'FY?\s*(\d{4})', user_query, re.I)
+                quarter_match = re.search(r'Q\s*([1-4])', user_query, re.I)
+                if year_match:
+                    requested_fiscal_year = year_match.group(1)
+                    logger.info(f"Extracted fiscal year: {requested_fiscal_year}")
+                if quarter_match:
+                    requested_quarter = quarter_match.group(1)
+                    logger.info(f"Extracted quarter: {requested_quarter}")
+            
+            if requested_fiscal_year and requested_quarter:
+                logger.info(f"Successfully extracted: FY{requested_fiscal_year} Q{requested_quarter} from query: {user_query}")
+            else:
+                logger.warning(f"Could not extract both fiscal_year and quarter from query: {user_query}")
         
         system_prompt = """You are an expert at understanding user queries about companies and stocks.
         
@@ -100,25 +169,80 @@ Then immediately use list_earnings_transcripts to get the available earnings tra
         
         return {
             "messages": [response],
-            "current_stage": "analyzing_query"
+            "current_stage": "analyzing_query",
+            "requested_fiscal_year": requested_fiscal_year,
+            "requested_quarter": requested_quarter
         }
     
     def transcript_retriever(state: EarningsAgentState) -> Dict[str, Any]:
         """Retrieve the earnings transcript content."""
         
-        system_prompt = """You are an expert at retrieving earnings transcripts from discountingcashflows.com.
+        # Get requested fiscal year and quarter from state if available
+        requested_fiscal_year = state.get("requested_fiscal_year")
+        requested_quarter = state.get("requested_quarter")
+        
+        logger.info(f"transcript_retriever: requested_fiscal_year={requested_fiscal_year}, requested_quarter={requested_quarter}")
+        
+        # Build system prompt with explicit values if available
+        if requested_fiscal_year and requested_quarter:
+            system_prompt = f"""You are an expert at retrieving earnings transcripts from discountingcashflows.com.
 
-Once you have the list of available transcripts, select the most appropriate one based on the user's request:
-- If they want the most recent, choose the first one (most recent fiscal year and quarter)
-- If they specify a quarter/year, choose the matching one
-- Use the get_earnings_transcript tool with:
+CRITICAL: The user has explicitly requested FY{requested_fiscal_year} Q{requested_quarter}. You MUST use these exact values.
+
+RULES:
+1. Call get_earnings_transcript EXACTLY ONCE with:
+   - symbol: The ticker symbol (extract from the conversation)
+   - fiscal_year: "{requested_fiscal_year}" (use this EXACT value - do NOT use "None" or leave it empty)
+   - quarter: "{requested_quarter}" (use this EXACT value - do NOT use "None" or leave it empty)
+
+2. Do NOT call the tool multiple times
+3. Do NOT use different fiscal year or quarter values
+4. Do NOT fetch multiple transcripts
+5. Do NOT pass "None" as a string - pass the actual values "{requested_fiscal_year}" and "{requested_quarter}"
+
+IMPORTANT: When calling get_earnings_transcript, you MUST provide:
+- fiscal_year: "{requested_fiscal_year}"
+- quarter: "{requested_quarter}"
+
+After calling get_earnings_transcript ONCE with fiscal_year="{requested_fiscal_year}" and quarter="{requested_quarter}", stop immediately.
+"""
+        else:
+            system_prompt = """You are an expert at retrieving earnings transcripts from discountingcashflows.com.
+
+CRITICAL RULES:
+1. Call get_earnings_transcript EXACTLY ONCE - do NOT call it multiple times
+2. When the user specifies a fiscal year and quarter, you MUST extract them correctly and use ONLY those values
+3. Do NOT fetch multiple transcripts - fetch ONLY the one the user requested
+
+Examples of user queries and how to extract:
+- "FY2025Q2" or "FY 2025 Q2" → fiscal_year: "2025", quarter: "2" → Call tool ONCE with these values
+- "2025 Q2" → fiscal_year: "2025", quarter: "2" → Call tool ONCE with these values
+- "Q2 2025" → fiscal_year: "2025", quarter: "2" → Call tool ONCE with these values
+- "second quarter 2025" → fiscal_year: "2025", quarter: "2" → Call tool ONCE with these values
+
+Extraction rules:
+- Look at the user's ORIGINAL query to find the fiscal year and quarter
+- Extract the year number (e.g., "2025" from "FY2025" or "2025")
+- Extract the quarter number (e.g., "2" from "Q2" or "2")
+- If the user says "FY2025Q2", extract fiscal_year="2025" and quarter="2"
+
+Once you have extracted the fiscal year and quarter from the user's query:
+- Call get_earnings_transcript tool EXACTLY ONCE with:
   - symbol: The ticker symbol (e.g., "NVDA")
-  - fiscal_year: The fiscal year as a string (e.g., "2025")
-  - quarter: The quarter number as a string "1", "2", "3", or "4"
+  - fiscal_year: The fiscal year as a string (e.g., "2025") - extract ONLY the year number
+  - quarter: The quarter number as a string "1", "2", "3", or "4" - extract ONLY the number
 
-The transcript will contain the complete earnings call with all speakers and their statements scraped from discountingcashflows.com.
+If the user does NOT specify a fiscal year and quarter:
+- Use the most recent transcript (first one in the list)
+- Still call the tool EXACTLY ONCE
 
-After retrieving the transcript, you do not need to do anything else - the system will automatically summarize it.
+DO NOT:
+- Call the tool multiple times
+- Fetch multiple transcripts
+- Iterate through quarters
+- Use different values than what the user specified
+
+After calling get_earnings_transcript ONCE, stop. Do not make any more tool calls.
 """
         
         messages_list = list(state["messages"])
@@ -126,9 +250,24 @@ After retrieving the transcript, you do not need to do anything else - the syste
         
         response = llm_with_tools.invoke(messages)
         
+        # Check if the response contains tool calls for get_earnings_transcript
+        transcript_retrieved = False
+        if hasattr(response, "tool_calls") and response.tool_calls:
+            # Count how many get_earnings_transcript calls are being made
+            transcript_calls = [tc for tc in response.tool_calls if tc.get("name") == "get_earnings_transcript"]
+            if len(transcript_calls) > 1:
+                # If multiple calls, keep only the first one
+                logger.warning(f"Agent attempted to make {len(transcript_calls)} get_earnings_transcript calls. Limiting to one.")
+                # Filter to keep only the first get_earnings_transcript call
+                other_calls = [tc for tc in response.tool_calls if tc.get("name") != "get_earnings_transcript"]
+                response.tool_calls = other_calls + [transcript_calls[0]] if transcript_calls else other_calls
+            if transcript_calls:
+                transcript_retrieved = True
+        
         return {
             "messages": [response],
-            "current_stage": "retrieving_transcript"
+            "current_stage": "retrieving_transcript",
+            "transcript_retrieved": transcript_retrieved
         }
     
     
@@ -267,11 +406,31 @@ Make sure to highlight KEY POINTS with specific numbers, percentages, and import
         """Determine next step after tool execution."""
         current_stage = state.get("current_stage", "analyzing_query")
         
+        # Check if we've already retrieved a transcript
+        transcript_retrieved = state.get("transcript_retrieved", False)
+        
+        # Check if any tool calls were for get_earnings_transcript
+        messages = state.get("messages", [])
+        last_message = messages[-1] if messages else None
+        
+        # If we just retrieved a transcript, mark it and move to summarizer
+        if last_message and hasattr(last_message, "tool_calls"):
+            for tool_call in getattr(last_message, "tool_calls", []):
+                if tool_call.get("name") == "get_earnings_transcript":
+                    transcript_retrieved = True
+                    break
+        
+        # If transcript was retrieved, go to summarizer
+        if transcript_retrieved:
+            return "summarizer"
+        
         # Stay in current stage to process tool results
         if current_stage == "analyzing_query":
             return "query_analyzer"
         elif current_stage == "retrieving_transcript":
-            return "transcript_retriever"
+            # If we're in retrieving_transcript stage and haven't retrieved yet, stay here
+            # But if we've already retrieved, go to summarizer
+            return "summarizer" if transcript_retrieved else "transcript_retriever"
         else:
             return "summarizer"
     
@@ -344,19 +503,63 @@ async def run_earnings_analysis(company_query: str) -> Dict[str, Any]:
         "summary": None,
         "current_stage": "analyzing_query",
         "error": None,
+        "requested_fiscal_year": None,
+        "requested_quarter": None,
+        "transcript_retrieved": False,
     }
     
     # Run the agent
     result = await agent.ainvoke(initial_state)
     
+    # Process messages to include all types (AIMessage, HumanMessage, ToolMessage, etc.)
+    processed_messages = []
+    for m in result.get("messages", []):
+        # Handle different message types
+        if isinstance(m, AIMessage):
+            processed_messages.append({
+                "role": "assistant",
+                "content": m.content if hasattr(m, 'content') else str(m)
+            })
+        elif isinstance(m, HumanMessage):
+            processed_messages.append({
+                "role": "user",
+                "content": m.content if hasattr(m, 'content') else str(m)
+            })
+        elif isinstance(m, SystemMessage):
+            processed_messages.append({
+                "role": "system",
+                "content": m.content if hasattr(m, 'content') else str(m)
+            })
+        elif isinstance(m, ToolMessage):
+            # ToolMessage contains tool execution results - show these as assistant messages
+            content = m.content if hasattr(m, 'content') else str(m)
+            if content and content.strip():
+                # Truncate very long tool results for display, but keep them
+                display_content = content[:2000] + "..." if len(content) > 2000 else content
+                processed_messages.append({
+                    "role": "assistant",
+                    "content": f"[Tool Result] {display_content}"
+                })
+        else:
+            # Handle other message types
+            if hasattr(m, 'content') and m.content:
+                # Tool results should be shown as assistant messages
+                processed_messages.append({
+                    "role": "assistant",
+                    "content": str(m.content) if m.content else ""
+                })
+            elif hasattr(m, '__str__'):
+                # Fallback: convert to string
+                content = str(m)
+                if content and content.strip():
+                    processed_messages.append({
+                        "role": "assistant",
+                        "content": content
+                    })
+    
     return {
         "summary": result.get("summary"),
-        "messages": [
-            {"role": "assistant" if isinstance(m, AIMessage) else "user" if isinstance(m, HumanMessage) else "system", 
-             "content": m.content if hasattr(m, 'content') else str(m)}
-            for m in result.get("messages", [])
-            if hasattr(m, 'content') and m.content
-        ],
+        "messages": processed_messages,
         "stage": result.get("current_stage"),
         "error": result.get("error"),
     }
@@ -378,6 +581,9 @@ def stream_earnings_analysis(company_query: str):
         "summary": None,
         "current_stage": "analyzing_query",
         "error": None,
+        "requested_fiscal_year": None,
+        "requested_quarter": None,
+        "transcript_retrieved": False,
     }
     
     # Stream the agent execution
