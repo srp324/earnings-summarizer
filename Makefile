@@ -26,7 +26,6 @@ install: install-backend install-frontend
 install-backend:
 	@echo "📦 Installing backend dependencies with uv..."
 	@cd backend && uv venv && uv pip install -r requirements.txt
-	@cd backend && . .venv/bin/activate && playwright install chromium
 	@echo "✅ Backend dependencies installed!"
 
 install-frontend:

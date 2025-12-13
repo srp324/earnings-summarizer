@@ -15,12 +15,13 @@ Write-Host "📚 Installing dependencies..." -ForegroundColor Cyan
 .\.venv\Scripts\Activate.ps1
 uv pip install -r requirements.txt
 
-Write-Host "🎭 Installing Playwright browsers..." -ForegroundColor Cyan
-playwright install chromium
-
 Write-Host "⚙️  Setting up environment..." -ForegroundColor Cyan
 if (!(Test-Path .env)) {
-    Copy-Item .env.example .env
+    @"
+OPENAI_API_KEY=
+FMP_API_KEY=
+DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/earnings_db
+"@ | Out-File -FilePath .env -Encoding utf8
     Write-Host "📝 Please edit .env and add your OPENAI_API_KEY" -ForegroundColor Yellow
 }
 

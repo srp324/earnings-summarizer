@@ -10,15 +10,11 @@ langchain-openai>=0.2.0
 langchain-community>=0.3.0
 langgraph>=0.2.0
 
-# Web scraping and search
-ddgs>=4.4.3
-playwright>=1.41.2
-beautifulsoup4>=4.12.3
+# Web scraping and HTTP clients
 httpx>=0.26.0
-
-# PDF parsing
-pypdf>=4.0.1
-pdfplumber>=0.10.3
+requests>=2.31.0
+beautifulsoup4>=4.12.3
+playwright>=1.41.2
 
 # Database
 asyncpg>=0.29.0

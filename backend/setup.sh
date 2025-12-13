@@ -19,13 +19,12 @@ echo "📚 Installing dependencies..."
 source .venv/bin/activate
 uv pip install -r requirements.txt
 
-echo "🎭 Installing Playwright browsers..."
-playwright install chromium
-
 echo "⚙️  Setting up environment..."
 if [ ! -f .env ]; then
-    cp .env.example .env
-    echo "📝 Please edit .env and add your OPENAI_API_KEY"
+    echo "OPENAI_API_KEY=" > .env
+    echo "FMP_API_KEY=" >> .env
+    echo "DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/earnings_db" >> .env
+    echo "📝 Please edit .env and add your OPENAI_API_KEY and FMP_API_KEY"
 fi
 
 echo ""
