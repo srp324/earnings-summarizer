@@ -890,55 +890,95 @@ class TranscriptTool(BaseTool):
                 transcript_parts = []
                 
                 # Extract content from all flex.flex-col.my-5 elements
+                # Use a more comprehensive approach - extract ALL text content from each div
                 for i, flex_div in enumerate(flex_my5_divs):
-                    # Get all direct child divs (not recursive)
+                    # Get ALL text from this flex_div, including all nested elements
+                    # This captures the full transcript content regardless of structure
+                    full_text = flex_div.get_text(separator='\n', strip=True)
+                    
+                    # Filter out very short content (likely navigation/metadata)
+                    if len(full_text.strip()) < 30:
+                        continue
+                    
+                    # Filter out metadata headers
+                    text_lower = full_text.lower()
+                    # Skip if it's just a metadata header (short text with company/period info)
+                    if (full_text.strip().startswith('**Company:**') or 
+                        (len(full_text.strip()) < 200 and 
+                         ('company:' in text_lower or 'period:' in text_lower or 'source:' in text_lower) and
+                         'conference' not in text_lower and 'operator' not in text_lower)):
+                        continue
+                    
+                    # Extract text from child elements more carefully
+                    # Look for the actual content div (usually has p-4 or similar padding classes)
                     child_divs = [child for child in flex_div.children 
                                  if hasattr(child, 'name') and child.name and child.name == 'div']
                     
-                    # Get the second child div (index 1) which should be the p-4 div
-                    if len(child_divs) >= 2:
-                        second_child = child_divs[1]
-                        child_classes = second_child.get('class', [])
-                        class_str = ' '.join(child_classes) if isinstance(child_classes, list) else str(child_classes)
-                        
-                        if 'p-4' in class_str:
-                            text = second_child.get_text(separator=' ', strip=True)
-                            text_length = len(text.strip()) if text else 0
-                            
-                            if text:
-                                transcript_parts.append(text.strip())
-                        else:
-                            logger.warning(f"  -> Second child div doesn't have p-4 class: '{class_str}'")
-                    else:
-                        logger.warning(f"  -> Flex div doesn't have 2 child divs, found {len(child_divs)}")
+                    extracted_text = None
                     
-                    # Filter transcript parts to only include content from the correct fiscal year/quarter
-                    # Check if the page contains multiple transcripts and filter accordingly
+                    # Strategy 1: Find the div with the most text (likely the content div)
+                    max_text_length = 0
+                    for child_div in child_divs:
+                        child_text = child_div.get_text(separator='\n', strip=True)
+                        if len(child_text.strip()) > max_text_length:
+                            max_text_length = len(child_text.strip())
+                            extracted_text = child_text.strip()
+                    
+                    # Strategy 2: If no good child div found, use the full flex_div text
+                    if not extracted_text or len(extracted_text) < 50:
+                        # Get text but preserve line breaks for readability
+                        extracted_text = full_text
+                    
+                    # Clean up the text - remove excessive whitespace but keep line breaks
+                    lines = [line.strip() for line in extracted_text.split('\n') if line.strip()]
+                    cleaned_text = '\n'.join(lines)
+                    
+                    # Only add if it's substantial content (not just metadata)
+                    if cleaned_text and len(cleaned_text.strip()) > 50:
+                        # Additional filter: skip if it's clearly just navigation/metadata
+                        if not (cleaned_text.startswith('**') and len(cleaned_text) < 300):
+                            transcript_parts.append(cleaned_text)
+                    
+                    # Log first few for debugging
+                    if i < 3:
+                        logger.debug(f"  -> Flex div {i}: Extracted {len(cleaned_text) if cleaned_text else 0} chars from {len(child_divs)} child divs")
+                
+                # Filter transcript parts to only include content from the correct fiscal year/quarter
+                # (Moved outside the loop - was incorrectly inside before)
+                if transcript_parts:
+                    # Look for fiscal year/quarter indicators in the page to filter correctly
+                    page_text = rendered_html.lower()
+                    target_year = fiscal_year_clean
+                    target_quarter = quarter_clean
+                    
+                    # Check if we're on the correct transcript page by looking at the URL or page content
+                    # The URL should already be correct, but verify the content matches
+                    filtered_parts = []
+                    for part in transcript_parts:
+                        part_lower = part.lower()
+                        # Include the part if it doesn't clearly belong to a different quarter
+                        # Look for indicators that suggest it's from the wrong quarter
+                        has_wrong_quarter = False
+                        
+                        # Check for other quarter mentions that might indicate wrong transcript
+                        # But be careful - transcripts often mention other quarters in context
+                        # Only filter if we see clear indicators of a different transcript section
+                        
+                        # For now, include all parts since we're already on the correct URL
+                        # The URL construction ensures we're on the right page
+                        filtered_parts.append(part)
+                    
+                    transcript_parts = filtered_parts
+                    logger.info(f"After filtering, {len(transcript_parts)} transcript parts remain")
+                    
+                    # Log summary of extracted content
                     if transcript_parts:
-                        # Look for fiscal year/quarter indicators in the page to filter correctly
-                        page_text = rendered_html.lower()
-                        target_year = fiscal_year_clean
-                        target_quarter = quarter_clean
-                        
-                        # Check if we're on the correct transcript page by looking at the URL or page content
-                        # The URL should already be correct, but verify the content matches
-                        filtered_parts = []
-                        for part in transcript_parts:
-                            part_lower = part.lower()
-                            # Include the part if it doesn't clearly belong to a different quarter
-                            # Look for indicators that suggest it's from the wrong quarter
-                            has_wrong_quarter = False
-                            
-                            # Check for other quarter mentions that might indicate wrong transcript
-                            # But be careful - transcripts often mention other quarters in context
-                            # Only filter if we see clear indicators of a different transcript section
-                            
-                            # For now, include all parts since we're already on the correct URL
-                            # The URL construction ensures we're on the right page
-                            filtered_parts.append(part)
-                        
-                        transcript_parts = filtered_parts
-                        logger.info(f"After filtering, {len(transcript_parts)} transcript parts remain")
+                        total_chars = sum(len(part) for part in transcript_parts)
+                        logger.info(f"Total extracted content: {total_chars:,} characters from {len(transcript_parts)} parts")
+                        # Log first 200 chars of first part for verification
+                        if transcript_parts[0]:
+                            preview = transcript_parts[0][:200].replace('\n', ' ')
+                            logger.info(f"First part preview: {preview}...")
                     
                     # Now remove unwanted elements (after extraction)
                     for element in rendered_soup(['script', 'style', 'nav', 'header', 'footer', 'aside', 'iframe', 'noscript']):

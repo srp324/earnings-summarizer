@@ -260,19 +260,50 @@ DO NOT use list_earnings_transcripts - proceed directly to the next step.
             # Extract transcript content (remove metadata headers)
             transcript_body = None
             if transcript_content:
-                # Remove the header metadata
-                lines = transcript_content.split('\n')
-                start_idx = 0
-                for i, line in enumerate(lines):
-                    if "---" in line or "Earnings Call Transcript" in line:
-                        # Start content after the separator
-                        start_idx = i + 1
-                        break
-                transcript_body = '\n'.join(lines[start_idx:])
+                # The transcript format is:
+                # **Earnings Call Transcript:**
+                # **Company:** NVDA
+                # **Period:** FY2026 Q3
+                # **Source:** discountingcashflows.com
+                # ---
+                # [ACTUAL TRANSCRIPT CONTENT]
+                # ---
+                # _Transcript length: ..._
+                # _Source URL: ..._
                 
-                # Remove trailing metadata
-                if "---" in transcript_body:
-                    transcript_body = transcript_body.split("---")[0].strip()
+                # Find the content between the two "---" separators
+                parts = transcript_content.split('---')
+                if len(parts) >= 3:
+                    # Content is between first and second "---"
+                    transcript_body = parts[1].strip()
+                else:
+                    # Fallback: try to find content after "Earnings Call Transcript" header
+                    lines = transcript_content.split('\n')
+                    start_idx = 0
+                    found_separator = False
+                    for i, line in enumerate(lines):
+                        if "---" in line:
+                            if not found_separator:
+                                start_idx = i + 1
+                                found_separator = True
+                            else:
+                                # Second separator - end here
+                                transcript_body = '\n'.join(lines[start_idx:i]).strip()
+                                break
+                    if not transcript_body:
+                        # Last resort: take everything after first separator
+                        transcript_body = '\n'.join(lines[start_idx:]).strip()
+                        # Remove trailing metadata if present
+                        if "_Transcript length:" in transcript_body:
+                            transcript_body = transcript_body.split("_Transcript length:")[0].strip()
+                        if "_Source URL:" in transcript_body:
+                            transcript_body = transcript_body.split("_Source URL:")[0].strip()
+                
+                # Log the extracted transcript length for debugging
+                if transcript_body:
+                    logger.info(f"Extracted transcript body: {len(transcript_body):,} characters")
+                else:
+                    logger.warning(f"Failed to extract transcript body from content ({len(transcript_content):,} chars)")
             
             # Try to extract ticker, fiscal year, quarter from transcript content if not in state
             if not ticker_symbol and transcript_content:

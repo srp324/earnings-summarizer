@@ -71,9 +71,24 @@ class RAGService:
         # Delete existing chunks for this transcript to avoid duplicates
         await self._delete_existing_chunks(ticker_symbol, fiscal_year, quarter)
         
+        # Log input for debugging
+        logger.info(f"Chunking transcript: {len(transcript_content):,} characters for {ticker_symbol} FY{fiscal_year} Q{quarter}")
+        logger.debug(f"First 200 chars of transcript: {transcript_content[:200]}...")
+        # Get chunk size from settings
+        settings = get_settings()
+        chunk_size = getattr(settings, "rag_chunk_size", DEFAULT_CHUNK_SIZE)
+        chunk_overlap = getattr(settings, "rag_chunk_overlap", DEFAULT_CHUNK_OVERLAP)
+        logger.debug(f"Text splitter config: chunk_size={chunk_size}, chunk_overlap={chunk_overlap}")
+        
         # Chunk the transcript
         chunks = self.text_splitter.split_text(transcript_content)
         logger.info(f"Split transcript into {len(chunks)} chunks for {ticker_symbol} FY{fiscal_year} Q{quarter}")
+        
+        # Log chunk sizes for debugging
+        if chunks:
+            chunk_sizes = [len(chunk) for chunk in chunks]
+            logger.info(f"Chunk sizes: min={min(chunk_sizes)}, max={max(chunk_sizes)}, avg={sum(chunk_sizes)//len(chunk_sizes)}")
+            logger.debug(f"First chunk preview: {chunks[0][:200]}...")
         
         if not chunks:
             logger.warning("No chunks created from transcript")
