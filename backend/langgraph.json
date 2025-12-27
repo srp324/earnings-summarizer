@@ -1,0 +1,9 @@
+{
+  "graphs": {
+    "earnings_agent": "./graph.py:graph"
+  },
+  "dependencies": ["requirements.txt"],
+  "env": ".env"
+}
+
+
