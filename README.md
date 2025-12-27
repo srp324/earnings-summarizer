@@ -219,8 +219,15 @@ npm run dev
 
 #### Database Setup
 
+**Note**: The database is optional for basic debugging. The app will start even if the database connection fails (it will show a warning but continue). However, for full functionality (RAG embeddings, session management), you'll need PostgreSQL.
+
+**Quick Setup (Recommended):**
+
 ```bash
-# Using Docker for PostgreSQL with pgvector
+# Option 1: Using Docker Compose (easiest)
+docker-compose up postgres -d
+
+# Option 2: Using Docker directly
 docker run -d \
   --name earnings-postgres \
   -e POSTGRES_USER=postgres \
@@ -229,6 +236,21 @@ docker run -d \
   -p 5432:5432 \
   pgvector/pgvector:pg16
 ```
+
+**Verify database is running:**
+```bash
+# Check if PostgreSQL is running
+docker ps | grep earnings-postgres
+# Or check port
+netstat -ano | findstr :5432  # Windows
+lsof -i :5432  # Mac/Linux
+```
+
+**For debugging without database:**
+- The app will start and work for basic API calls
+- You'll see a warning: "Database initialization skipped"
+- RAG features and session persistence won't work
+- This is fine for frontend/backend integration debugging
 
 ## 📖 API Reference
 
@@ -357,6 +379,68 @@ GET /api/v1/sessions/{session_id}
 | `RAG_CHUNK_SIZE` | Characters per chunk | `1000` |
 | `RAG_CHUNK_OVERLAP` | Overlap between chunks | `200` |
 | `RAG_TOP_K` | Number of chunks to retrieve | `10` |
+| `LANGCHAIN_TRACING_V2` | Enable LangSmith tracing | `true` (optional) |
+| `LANGCHAIN_API_KEY` | LangSmith API key for tracing | - |
+| `LANGCHAIN_PROJECT` | LangSmith project name | `earnings-summarizer` (optional) |
+
+### LangSmith Tracing (Optional)
+
+To visualize LangGraph graph traversals in LangSmith:
+
+1. **Get a LangSmith API key:**
+   - Sign up at https://smith.langchain.com
+   - Go to Settings → API Keys
+   - Create a new API key
+
+2. **Add to your `.env` file:**
+   ```bash
+   LANGCHAIN_TRACING_V2=true
+   LANGCHAIN_API_KEY=your-api-key-here
+   LANGCHAIN_PROJECT=earnings-summarizer
+   ```
+
+3. **Run your application** - LangGraph automatically sends traces when these env vars are set
+
+4. **View traces in LangSmith:**
+   - Open https://smith.langchain.com
+   - Navigate to your project
+   - Click on any trace to see the graph traversal visualization
+
+**Note:** LangSmith is a cloud service (not a local CLI tool). The graph visualization happens in the web UI. You can also use `langsmith-fetch` CLI tool to fetch traces programmatically if needed.
+
+### LangGraph Studio (Local Development)
+
+LangGraph Studio provides a local IDE for visualizing and debugging your LangGraph agents. To use it:
+
+1. **Install dependencies** (if not already installed):
+   ```bash
+   cd backend
+   pip install -r requirements.txt
+   ```
+
+2. **Start LangGraph Studio:**
+   ```bash
+   cd backend
+   langgraph dev
+   ```
+
+3. **Access the Studio UI:**
+   - The command will output a URL like: `https://smith.langchain.com/studio/?baseUrl=http://127.0.0.1:2024`
+   - Open this URL in your browser
+   - You'll see your graph visualization and can interact with it
+
+4. **Optional: Use tunnel mode (for Safari or secure connections):**
+   ```bash
+   langgraph dev --tunnel
+   ```
+
+The Studio will:
+- Visualize your graph structure
+- Show graph traversal in real-time
+- Allow you to test your agent interactively
+- Debug node executions step-by-step
+
+**Note:** Make sure your `.env` file is configured with `OPENAI_API_KEY` before running.
 
 ## ⚠️ Known Limitations & Complications
 
@@ -435,6 +519,130 @@ black --check .
 cd frontend
 npm run lint
 ```
+
+### Debugging in Windsurf/VS Code
+
+The project includes debug configurations for both backend and frontend:
+
+#### Available Debug Configurations
+
+1. **Python: FastAPI Backend** - Debug the Python backend server
+   - Sets breakpoints in Python files
+   - Hot reload enabled
+   - Runs on `http://localhost:8000`
+
+2. **Python: FastAPI Backend (via run.py)** - Alternative backend debugger using `run.py`
+   - Same as above but uses the `run.py` entry point
+
+3. **Chrome: Frontend** - Debug the React frontend in Chrome
+   - Sets breakpoints in TypeScript/React files
+   - Automatically starts the Vite dev server
+   - Opens Chrome at `http://localhost:5173`
+
+4. **Debug Full Stack** - Debug both backend and frontend simultaneously
+   - Launches both servers
+   - Allows debugging across the full stack
+   - **Note**: If you see an error about "compound" type, you can run the configurations separately:
+     1. Start "Python: FastAPI Backend (Debug Mode)" first
+     2. Then start "Chrome: Frontend (server already running)" once backend is ready
+
+#### How to Use
+
+**For Full Stack Debugging (Recommended Approach):**
+
+Since compound configurations may not work reliably in all environments, use this two-step process:
+
+1. **Start the Backend First:**
+   - Select "Python: FastAPI Backend (Debug Mode)" from the debug dropdown
+   - Press `F5` to start debugging
+   - **Wait** until you see "Uvicorn running on http://0.0.0.0:8000" in the terminal
+   - Verify it's running: Open http://localhost:8000/docs in your browser
+
+2. **Then Start the Frontend:**
+   - Select "Chrome: Frontend (server already running)" from the debug dropdown
+   - Press `F5` to start debugging
+   - Chrome will open automatically with the frontend
+
+**Alternative: Individual Debugging**
+
+1. **Set breakpoints** in your code by clicking in the gutter next to line numbers
+
+2. **Start debugging:**
+   - Press `F5` or go to Run and Debug panel (Ctrl+Shift+D)
+   - Select a debug configuration from the dropdown
+   - Click the green play button or press `F5`
+
+3. **Debug controls:**
+   - `F5` - Continue
+   - `F10` - Step Over
+   - `F11` - Step Into
+   - `Shift+F11` - Step Out
+   - `Shift+F5` - Stop
+
+#### Prerequisites
+
+- **Python Extension**: Install the Python extension for VS Code/Windsurf
+- **Chrome Debugger Extension**: Install the "Debugger for Chrome" extension (if not already included)
+- **Virtual Environment**: Ensure your Python virtual environment is activated (`.venv` in `backend/`)
+
+#### Troubleshooting
+
+- **Python path issues**: The configuration uses `${command:python.interpreterPath}`. Make sure you've selected the correct Python interpreter (Ctrl+Shift+P → "Python: Select Interpreter")
+- **Backend not starting in debugger**: 
+  - **CRITICAL: Verify Python interpreter is selected:**
+    1. Press `Ctrl+Shift+P` (or `Cmd+Shift+P` on Mac)
+    2. Type "Python: Select Interpreter"
+    3. **Choose the interpreter from `backend/.venv/Scripts/python.exe`** (Windows) or `backend/.venv/bin/python` (Mac/Linux)
+    4. It should show something like: "Python 3.11.x ('venv': venv)"
+  - **Test backend manually first** (this verifies everything works):
+    ```bash
+    cd backend
+    
+    # On Windows (PowerShell/CMD):
+    .venv\Scripts\activate
+    python run_debug.py
+    
+    # On Windows (Git Bash):
+    .venv/Scripts/python.exe run_debug.py
+    
+    # On Mac/Linux:
+    source .venv/bin/activate
+    python run_debug.py
+    ```
+    If this works, the backend is fine - the issue is with the debugger configuration.
+  - **Check Debug Console**: When debugging, look for:
+    - A separate terminal/console showing Python output
+    - You should see: `Starting Earnings Summarizer API...` and `INFO: Uvicorn running on http://0.0.0.0:8000`
+    - If you don't see this, the debugger isn't starting the backend
+  - **Verify virtual environment exists:**
+    - Windows: Check for `backend/.venv/Scripts/python.exe`
+    - Mac/Linux: Check for `backend/.venv/bin/python`
+    - If missing, run: `cd backend && uv venv && uv pip install -r requirements.txt`
+  - **Ensure `.env` file exists** in `backend/` directory with `OPENAI_API_KEY` set
+  - **If backend debugger still doesn't start**: Use the manual approach - start backend manually, then debug frontend
+- **Database authentication errors**: 
+  - **This is OK for debugging!** The app will start even if the database connection fails
+  - You'll see: "Database initialization skipped: [error]" - this is expected
+  - To fix: Start PostgreSQL with `docker-compose up postgres -d` or see Database Setup section
+  - For basic debugging, you can ignore database errors - the API will still work
+- **Frontend proxy errors (ECONNREFUSED)**: 
+  - This is normal if the backend hasn't started yet - the frontend will retry when you make a request
+  - Verify the backend is running by checking for a terminal with "Uvicorn running on http://0.0.0.0:8000"
+  - If backend is running but still getting errors, check that it's listening on `localhost:8000` (not just `0.0.0.0`)
+- **Frontend not starting / "vite is not recognized"**: 
+  - First, ensure Node.js dependencies are installed:
+    ```bash
+    cd frontend
+    npm install
+    ```
+  - If the error persists, manually start the frontend dev server in a terminal:
+    ```bash
+    cd frontend
+    npm run dev
+    ```
+  - Then use the "Chrome: Frontend (server already running)" debug configuration instead
+- **Port conflicts**: If ports 8000 or 5173 are in use, stop those services first
+- **Windows-specific issues**: If npm commands fail, try using `npm.cmd` explicitly or ensure npm is in your PATH
 
 ## 🤝 Contributing
 
