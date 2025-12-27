@@ -11,7 +11,7 @@ class Settings(BaseSettings):
     tavily_api_key: str = ""
     
     # Database
-    database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/earnings_db"
+    database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5433/earnings_db"
     
     # Server
     host: str = "0.0.0.0"
