@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     # RAG Settings
     rag_chunk_size: int = 1000  # Characters per chunk
     rag_chunk_overlap: int = 200  # Overlap between chunks
-    rag_top_k: int = 10  # Number of chunks to retrieve for summarization
+    rag_top_k: int = 20  # Number of chunks to retrieve for summarization
     rag_enabled: bool = True  # Enable RAG for transcript processing
     
     model_config = SettingsConfigDict(

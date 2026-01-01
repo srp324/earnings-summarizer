@@ -43,7 +43,7 @@ class RAGService:
             length_function=len,
             separators=["\n\n", "\n", ". ", " ", ""],  # Try to split on paragraphs first
         )
-        self.top_k = getattr(settings, "rag_top_k", 10)
+        self.top_k = getattr(settings, "rag_top_k", 20)
     
     async def chunk_and_store_transcript(
         self,

@@ -555,7 +555,7 @@ After calling get_earnings_transcript EXACTLY ONCE, stop immediately. Do not mak
                 if is_chunked:
                     # Use RAG: retrieve relevant chunks for comprehensive summary
                     # Use a broad query to get chunks covering all major topics
-                    summary_query = "financial highlights revenue earnings per share EPS profitability margins free cash flow business segments performance metrics operational highlights management commentary strategic outlook guidance risks challenges announcements"
+                    summary_query = "financial highlights revenue earnings per share EPS profitability margins free cash flow business segments performance metrics operational highlights management commentary strategic outlook guidance risks challenges announcements growth catalysts"
                     
                     relevant_chunks = await rag_service.retrieve_relevant_chunks(
                         query=summary_query,
