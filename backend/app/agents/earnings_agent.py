@@ -1218,7 +1218,6 @@ async def stream_earnings_analysis(company_query: str):
     }
     
     # Stream the agent execution
-    final_result = None
     current_state = initial_state.copy()
     async for event in agent.astream(initial_state):
         # Yield each step's updates
@@ -1446,8 +1445,4 @@ async def stream_earnings_analysis(company_query: str):
             # This ensures we capture transcript_retriever even if reasoning extraction fails
             logger.info(f"Yielding update for {node_name}: stage={update['stage']}, current_stage={current_stage}, has_reasoning={bool(reasoning)}")
             yield update
-            
-            # Keep track of final result
-            if summary:
-                final_result = update
 
