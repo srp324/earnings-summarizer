@@ -31,9 +31,6 @@ class EarningsAgentState(TypedDict):
     company_query: str
     ticker_symbol: Optional[str]
     company_name: Optional[str]
-    ir_url: Optional[str]
-    earnings_links: List[Dict[str, str]]
-    parsed_documents: List[Dict[str, str]]
     summary: Optional[str]
     current_stage: str
     error: Optional[str]
@@ -1124,9 +1121,6 @@ async def run_earnings_analysis(company_query: str) -> Dict[str, Any]:
         "company_query": company_query,
         "ticker_symbol": None,
         "company_name": None,
-        "ir_url": None,
-        "earnings_links": [],
-        "parsed_documents": [],
         "summary": None,
         "current_stage": "analyzing_query",
         "error": None,
@@ -1202,9 +1196,6 @@ async def stream_earnings_analysis(company_query: str):
         "company_query": company_query,
         "ticker_symbol": None,
         "company_name": None,
-        "ir_url": None,
-        "earnings_links": [],
-        "parsed_documents": [],
         "summary": None,
         "current_stage": "analyzing_query",
         "error": None,
