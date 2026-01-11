@@ -7,6 +7,7 @@ from sqlalchemy import select
 import uuid
 import json
 import asyncio
+import logging
 from datetime import datetime
 from typing import AsyncGenerator
 
@@ -28,6 +29,7 @@ from app.session_manager import get_session_manager
 from langchain_core.messages import AIMessage
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 # Initialize conversation router
 conversation_router = ConversationRouter()
@@ -121,23 +123,9 @@ async def analyze_earnings_stream(
             db.add(session)
             await db.commit()
             
-            # Stage messages
-            stage_messages = {
-                "analyzing_query": "Analyzing your query and identifying the company...",
-                "finding_ir_site": "Searching for the investor relations website...",
-                "parsing_documents": "Downloading and parsing earnings reports...",
-                "summarizing": "Generating comprehensive summary...",
-                "complete": "Analysis complete!",
-            }
-            
-            # Run analysis with streaming
+            # Run analysis (non-streaming endpoint - consider using /chat/stream for real-time updates)
             try:
                 result = await run_earnings_analysis(request.company_query)
-                
-                # Send stage updates
-                for stage, message in stage_messages.items():
-                    yield f"data: {json.dumps({'session_id': session_id, 'stage': stage, 'message': message})}\n\n"
-                    await asyncio.sleep(0.1)  # Small delay for UI updates
                 
                 # Send final result
                 final_update = {
@@ -256,7 +244,7 @@ async def chat_stream(
             session.add_message("user", request.message)
             
             # Send initial event
-            yield f"data: {json.dumps({'type': 'status', 'stage': 'routing', 'message': 'Analyzing your request...'})}\n\n"
+            yield f"data: {json.dumps({'type': 'status', 'session_id': session.session_id, 'stage': 'routing', 'message': 'Analyzing your request...'})}\n\n"
             
             # Route the conversation
             routing_result = await conversation_router.route_conversation(
@@ -302,43 +290,92 @@ async def chat_stream(
                 # Map agent stages to frontend stages
                 stage_mapping = {
                     "analyzing_query": {"id": "analyzing", "label": "Analyzing Query"},
+                    "checking_embeddings": {"id": "searching", "label": "Retrieving Reports"},
                     "retrieving_transcript": {"id": "searching", "label": "Retrieving Reports"},
-                    "storing_embeddings": {"id": "parsing", "label": "Storing Embeddings"},
+                    "storing_embeddings": {"id": "summarizing", "label": "Generating Summary"},
                     "complete": {"id": "summarizing", "label": "Generating Summary"},
                 }
                 
                 # Stream analysis with real-time updates
                 final_result = None
-                last_stage = None
+                last_mapped_stage = None  # Track the last mapped stage (with id and label)
+                current_active_stage_id = None  # Track the currently active stage ID
                 async for update in stream_earnings_analysis(company_query):
                     stage = update.get("stage", "processing")
                     node = update.get("node", "")
-                    last_stage = stage
+                    reasoning = update.get("reasoning")  # Extract reasoning from update
+                    
+                    # Log all updates from stream for debugging
+                    logger.info(f"Received update from stream: node={node}, stage={stage}")
+                    
+                    # Skip stage updates for "tools" node - it doesn't represent a stage
+                    # The previous stage (e.g., "Retrieving Reports") should remain active during tool execution
+                    if node == "tools":
+                        logger.debug(f"Skipping stage update for tools node (previous stage '{current_active_stage_id}' remains active)")
+                        continue
+                    
+                    # Skip if stage is "processing" and not in our mapping (invalid stage)
+                    if stage == "processing" and stage not in stage_mapping:
+                        logger.debug(f"Skipping stage update for invalid stage: {stage}")
+                        continue
                     
                     # Map stage to frontend stage
                     mapped_stage = stage_mapping.get(stage, {"id": stage, "label": stage.replace("_", " ").title()})
+                    current_stage_id = mapped_stage.get('id')
+                    
+                    # Mark previous stage as complete when moving to a new stage
+                    if last_mapped_stage and last_mapped_stage.get('id') != current_stage_id:
+                        complete_update_data = {
+                            'type': 'stage_update',
+                            'session_id': session.session_id,
+                            'stage_id': last_mapped_stage.get('id'),
+                            'stage_label': last_mapped_stage.get('label'),
+                            'status': 'complete'
+                        }
+                        yield f"data: {json.dumps(complete_update_data)}\n\n"
+                    
+                    # Update last mapped stage and current active stage
+                    last_mapped_stage = mapped_stage
+                    current_active_stage_id = mapped_stage.get('id')
+                    
+                    # Log all stage updates for debugging
+                    logger.info(f"Processing stage update: node={node}, stage={stage}, mapped_stage={mapped_stage.get('id')}, mapped_label={mapped_stage.get('label')}, has_reasoning={bool(reasoning)}")
+                    
+                    # Send reasoning event first if it exists (as a separate visible step)
+                    if reasoning and reasoning.strip():
+                        reasoning_data = {
+                            'type': 'reasoning',
+                            'session_id': session.session_id,
+                            'stage_id': mapped_stage['id'],
+                            'stage_label': mapped_stage['label'],
+                            'node': node,
+                            'reasoning': reasoning
+                        }
+                        logger.info(f"Sending reasoning event for stage {mapped_stage['id']}: {reasoning[:100]}...")
+                        yield f"data: {json.dumps(reasoning_data)}\n\n"
                     
                     # Send stage update
                     stage_update_data = {
                         'type': 'stage_update',
+                        'session_id': session.session_id,
                         'stage_id': mapped_stage['id'],
                         'stage_label': mapped_stage['label'],
                         'node': node,
-                        'status': 'active'
+                        'status': 'active',
                     }
+                    
+                    # Also include reasoning in stage_update for backwards compatibility
+                    if reasoning and reasoning.strip():
+                        stage_update_data['reasoning'] = reasoning
+                    
                     yield f"data: {json.dumps(stage_update_data)}\n\n"
                     
                     # Track final result (keep updating as we get more complete data)
                     if update.get("has_summary") or update.get("summary"):
                         final_result = update
-                        # Mark summarizing stage as complete
-                        complete_update_data = {
-                            'type': 'stage_update',
-                            'stage_id': 'summarizing',
-                            'stage_label': 'Generating Summary',
-                            'status': 'complete'
-                        }
-                        yield f"data: {json.dumps(complete_update_data)}\n\n"
+                        # Don't mark as complete here - wait until stream is finished
+                        # The stage will be marked complete when we actually move to a different stage
+                        # or when the analysis is fully complete (handled after the stream loop)
                 
                 # Use final result from stream if available, otherwise run full analysis
                 if final_result and final_result.get("summary"):
@@ -392,6 +429,17 @@ async def chat_stream(
                 # Add assistant message to history
                 session.add_message("assistant", summary)
                 
+                # Mark the last active stage as complete when stream finishes
+                if last_mapped_stage and last_mapped_stage.get('id'):
+                    complete_update_data = {
+                        'type': 'stage_update',
+                        'session_id': session.session_id,
+                        'stage_id': last_mapped_stage.get('id'),
+                        'stage_label': last_mapped_stage.get('label'),
+                        'status': 'complete'
+                    }
+                    yield f"data: {json.dumps(complete_update_data)}\n\n"
+                
                 # Send final result
                 complete_data = {
                     'type': 'complete',
@@ -405,7 +453,7 @@ async def chat_stream(
             
             else:  # action == "chat"
                 # Generate chat response
-                yield f"data: {json.dumps({'type': 'status', 'stage': 'thinking', 'message': 'Generating response...'})}\n\n"
+                yield f"data: {json.dumps({'type': 'status', 'session_id': session.session_id, 'stage': 'thinking', 'message': 'Generating response...'})}\n\n"
                 
                 response_message = await create_chat_response(
                     user_input=request.message,
@@ -429,11 +477,14 @@ async def chat_stream(
         
         except Exception as e:
             error_message = f"Sorry, I encountered an error: {str(e)}"
+            session_id = None
             if 'session' in locals():
                 session.add_message("assistant", error_message)
+                session_id = session.session_id
             
             error_data = {
                 'type': 'error',
+                'session_id': session_id,
                 'error': str(e),
                 'message': error_message,
                 'is_complete': True

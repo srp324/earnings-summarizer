@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
-import { Send, TrendingUp, Loader2, Sparkles, BarChart3, FileText, Search, CheckCircle, AlertCircle } from 'lucide-react'
+import { Send, TrendingUp, Loader2, Sparkles, BarChart3, FileText, Search, CheckCircle, AlertCircle, ChevronDown, ChevronUp } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 
 interface Message {
@@ -15,12 +15,12 @@ interface AnalysisStage {
   label: string
   status: 'pending' | 'active' | 'complete' | 'error'
   icon: React.ReactNode
+  reasoning?: string
 }
 
 const stages: AnalysisStage[] = [
   { id: 'analyzing', label: 'Analyzing Query', status: 'pending', icon: <Search className="w-4 h-4" /> },
   { id: 'searching', label: 'Retrieving Reports', status: 'pending', icon: <TrendingUp className="w-4 h-4" /> },
-  { id: 'parsing', label: 'Storing Embeddings', status: 'pending', icon: <FileText className="w-4 h-4" /> },
   { id: 'summarizing', label: 'Generating Summary', status: 'pending', icon: <Sparkles className="w-4 h-4" /> },
 ]
 
@@ -32,6 +32,7 @@ function App() {
   const [showWelcome, setShowWelcome] = useState(true)
   const [sessionId, setSessionId] = useState<string | null>(null)
   const [isAnalyzing, setIsAnalyzing] = useState(false)
+  const [expandedStages, setExpandedStages] = useState<Set<string>>(new Set())
   const messagesEndRef = useRef<HTMLDivElement>(null)
 
   const scrollToBottom = () => {
@@ -42,14 +43,31 @@ function App() {
     scrollToBottom()
   }, [messages])
 
-  const updateStage = (stageId: string, status: 'pending' | 'active' | 'complete' | 'error') => {
+  const updateStage = (stageId: string, status: 'pending' | 'active' | 'complete' | 'error', reasoning?: string) => {
     setCurrentStages(prev => prev.map(s => 
-      s.id === stageId ? { ...s, status } : s
+      s.id === stageId ? { 
+        ...s, 
+        status,
+        reasoning: reasoning !== undefined ? reasoning : s.reasoning  // Preserve existing reasoning if not provided
+      } : s
     ))
   }
 
   const resetStages = () => {
-    setCurrentStages(stages.map(s => ({ ...s, status: 'pending' as const })))
+    setCurrentStages(stages.map(s => ({ ...s, status: 'pending' as const, reasoning: undefined })))
+    setExpandedStages(new Set())
+  }
+  
+  const toggleStageReasoning = (stageId: string) => {
+    setExpandedStages(prev => {
+      const newSet = new Set(prev)
+      if (newSet.has(stageId)) {
+        newSet.delete(stageId)
+      } else {
+        newSet.add(stageId)
+      }
+      return newSet
+    })
   }
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -113,6 +131,7 @@ function App() {
             if (line.startsWith('data: ')) {
               try {
                 const data = JSON.parse(line.slice(6))
+                console.log('[SSE Event]', data.type, data)  // Log all SSE events
                 
                 // Handle different event types
                 if (data.type === 'status') {
@@ -120,32 +139,80 @@ function App() {
                   if (data.stage === 'thinking') {
                     setIsAnalyzing(false)
                   }
+                } else if (data.type === 'reasoning') {
+                  // Reasoning event - show AI reasoning as a visible step
+                  const stageId = data.stage_id
+                  const reasoning = data.reasoning
+                  
+                  console.log(`[Reasoning Event] ${stageId}:`, {
+                    stage_label: data.stage_label,
+                    node: data.node,
+                    reasoning_length: reasoning ? reasoning.length : 0,
+                    reasoning_preview: reasoning ? reasoning.substring(0, 100) : null
+                  })
+                  
+                  // Update the stage with reasoning
+                  if (reasoning && reasoning.trim()) {
+                    setCurrentStages(prev => prev.map(s => {
+                      if (s.id === stageId) {
+                        const hasNewReasoning = !s.reasoning
+                        // Auto-expand reasoning when it first appears
+                        if (hasNewReasoning) {
+                          setExpandedStages(prevExpanded => new Set([...prevExpanded, stageId]))
+                        }
+                        return {
+                          ...s,
+                          label: data.stage_label || s.label,
+                          reasoning: reasoning
+                        }
+                      }
+                      return s
+                    }))
+                  }
                 } else if (data.type === 'stage_update') {
                   // Stage update - update UI in real-time
                   setIsAnalyzing(true)
                   const stageId = data.stage_id
                   const status = data.status === 'active' ? 'active' : 
                                 data.status === 'complete' ? 'complete' : 'pending'
+                  const reasoning = data.reasoning  // Capture reasoning from backend
                   
-                  // Update the specific stage with label if provided by backend
-                  if (data.stage_label) {
-                    setCurrentStages(prev => prev.map(s => 
-                      s.id === stageId ? { ...s, label: data.stage_label, status } : s
-                    ))
-                  } else {
-                    updateStage(stageId, status)
-                  }
+                  // Debug logging - log ALL stage updates
+                  console.log(`[Stage Update] ${stageId}: status=${status}`, {
+                    stage_label: data.stage_label,
+                    node: data.node,
+                    has_reasoning: !!reasoning,
+                    reasoning_length: reasoning ? reasoning.length : 0,
+                    reasoning_preview: reasoning ? reasoning.substring(0, 100) : null,
+                    full_data: data
+                  })
                   
-                  // Mark previous stages as complete
-                  const stageIndex = stages.findIndex(s => s.id === stageId)
-                  if (stageIndex > 0) {
-                    for (let i = 0; i < stageIndex; i++) {
-                      const prevStage = stages[i]
-                      if (prevStage.id !== stageId) {
-                        updateStage(prevStage.id, 'complete')
+                  // Update the specific stage with label and reasoning if provided by backend
+                  setCurrentStages(prev => {
+                    return prev.map((s) => {
+                      if (s.id === stageId) {
+                        // Update the target stage
+                        const hasNewReasoning = reasoning !== undefined && reasoning !== null && reasoning.trim().length > 0
+                        const newReasoning = hasNewReasoning ? reasoning : s.reasoning
+                        
+                        // Auto-expand reasoning when it first appears
+                        if (hasNewReasoning && !s.reasoning) {
+                          setExpandedStages(prevExpanded => new Set([...prevExpanded, stageId]))
+                        }
+                        
+                        return {
+                          ...s, 
+                          label: data.stage_label || s.label, 
+                          status,
+                          reasoning: newReasoning
+                        }
                       }
-                    }
-                  }
+                      
+                      // Leave other stages unchanged - backend will explicitly send 'complete' status
+                      // for previous stages when transitioning to new stages
+                      return s
+                    })
+                  })
                 } else if (data.type === 'complete') {
                   // Final result received
                   assistantContent = data.message || assistantContent
@@ -295,7 +362,7 @@ function App() {
                     <Sparkles className="w-12 h-12 text-ocean-400" />
                   </div>
                   <h2 className="font-display text-2xl font-semibold text-white mb-3">
-                    What company would you like to analyze?
+                    What company reports would you like to analyze?
                   </h2>
                   <p className="text-slate-400 mb-8 text-center max-w-md">
                     Enter a company name or stock ticker symbol, and I'll fetch and summarize their latest earnings report.
@@ -353,40 +420,85 @@ function App() {
                       <>
                         {/* Stage indicators for analysis */}
                         <div className="space-y-3 mb-4">
-                          {currentStages.map((stage, index) => (
-                            <motion.div
-                              key={stage.id}
-                              initial={{ opacity: 0, x: -10 }}
-                              animate={{ opacity: 1, x: 0 }}
-                              transition={{ delay: index * 0.1 }}
-                              className={`flex items-center gap-3 ${
-                                stage.status === 'active' ? 'text-ocean-400' :
-                                stage.status === 'complete' ? 'text-emerald-400' :
-                                stage.status === 'error' ? 'text-coral-500' :
-                                'text-slate-500'
-                              }`}
-                            >
-                              <div className="relative">
-                                {stage.status === 'active' ? (
-                                  <Loader2 className="w-4 h-4 animate-spin" />
-                                ) : stage.status === 'complete' ? (
-                                  <CheckCircle className="w-4 h-4" />
-                                ) : stage.status === 'error' ? (
-                                  <AlertCircle className="w-4 h-4" />
-                                ) : (
-                                  stage.icon
-                                )}
-                              </div>
-                              <span className="text-sm font-medium">{stage.label}</span>
-                              {stage.status === 'active' && (
-                                <div className="flex gap-1 ml-auto">
-                                  <span className="typing-dot w-1.5 h-1.5 bg-ocean-400 rounded-full" />
-                                  <span className="typing-dot w-1.5 h-1.5 bg-ocean-400 rounded-full" />
-                                  <span className="typing-dot w-1.5 h-1.5 bg-ocean-400 rounded-full" />
+                          {currentStages.map((stage, index) => {
+                            const isExpanded = expandedStages.has(stage.id)
+                            const hasReasoning = stage.reasoning && stage.reasoning.trim().length > 0
+                            
+                            return (
+                              <motion.div
+                                key={stage.id}
+                                initial={{ opacity: 0, x: -10 }}
+                                animate={{ opacity: 1, x: 0 }}
+                                transition={{ delay: index * 0.1 }}
+                                className="space-y-2"
+                              >
+                                <div className={`flex items-center gap-3 ${
+                                  stage.status === 'active' ? 'text-ocean-400' :
+                                  stage.status === 'complete' ? 'text-emerald-400' :
+                                  stage.status === 'error' ? 'text-coral-500' :
+                                  'text-slate-500'
+                                }`}>
+                                  <div className="relative">
+                                    {stage.status === 'active' ? (
+                                      <Loader2 className="w-4 h-4 animate-spin" />
+                                    ) : stage.status === 'complete' ? (
+                                      <CheckCircle className="w-4 h-4" />
+                                    ) : stage.status === 'error' ? (
+                                      <AlertCircle className="w-4 h-4" />
+                                    ) : (
+                                      stage.icon
+                                    )}
+                                  </div>
+                                  <span className="text-sm font-medium flex-1">{stage.label}</span>
+                                  {hasReasoning ? (
+                                    <button
+                                      onClick={() => toggleStageReasoning(stage.id)}
+                                      className={`ml-2 p-1.5 rounded transition-colors flex items-center gap-1 ${
+                                        isExpanded 
+                                          ? 'bg-slate-700/70 hover:bg-slate-600/70 text-ocean-300' 
+                                          : 'hover:bg-slate-700/50 text-slate-400 hover:text-ocean-400'
+                                      }`}
+                                      title={isExpanded ? "Hide reasoning" : "Show AI reasoning"}
+                                    >
+                                      <span className="text-xs font-medium">
+                                        {isExpanded ? 'Hide' : 'Show'} Reasoning
+                                      </span>
+                                      {isExpanded ? (
+                                        <ChevronUp className="w-3.5 h-3.5" />
+                                      ) : (
+                                        <ChevronDown className="w-3.5 h-3.5" />
+                                      )}
+                                    </button>
+                                  ) : (
+                                    stage.status === 'active' && (
+                                      <div className="flex gap-1 ml-auto">
+                                        <span className="typing-dot w-1.5 h-1.5 bg-ocean-400 rounded-full" />
+                                        <span className="typing-dot w-1.5 h-1.5 bg-ocean-400 rounded-full" />
+                                        <span className="typing-dot w-1.5 h-1.5 bg-ocean-400 rounded-full" />
+                                      </div>
+                                    )
+                                  )}
                                 </div>
-                              )}
-                            </motion.div>
-                          ))}
+                                
+                                {/* Reasoning section - expandable */}
+                                {hasReasoning && isExpanded && (
+                                  <motion.div
+                                    initial={{ opacity: 0, height: 0 }}
+                                    animate={{ opacity: 1, height: 'auto' }}
+                                    exit={{ opacity: 0, height: 0 }}
+                                    className="ml-7 mt-2 p-3 rounded-lg bg-slate-900/50 border border-slate-700/50"
+                                  >
+                                    <div className="text-xs font-semibold text-slate-400 mb-2 uppercase tracking-wide">
+                                      AI Reasoning
+                                    </div>
+                                    <div className="text-sm text-slate-300 whitespace-pre-wrap break-words">
+                                      {stage.reasoning}
+                                    </div>
+                                  </motion.div>
+                                )}
+                              </motion.div>
+                            )
+                          })}
                         </div>
                         <p className="text-slate-400 text-sm">
                           Analyzing earnings reports...

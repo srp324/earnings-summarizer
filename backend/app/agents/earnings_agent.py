@@ -145,6 +145,42 @@ def create_earnings_agent():
             else:
                 logger.warning(f"Could not extract both fiscal_year and quarter from query: {user_query}")
         
+        # Try to extract ticker symbol from user query
+        ticker_symbol = state.get("ticker_symbol")
+        if not ticker_symbol and user_query:
+            # Look for ticker-like patterns (1-5 uppercase letters, possibly preceded by $)
+            ticker_patterns = [
+                r'\$([A-Z]{1,5})\b',  # $NVDA, $AAPL
+                r'\b([A-Z]{1,5})\s+(?:FY|Q|fiscal|quarter)',  # NVDA FY2025, AAPL Q2
+                r'\b([A-Z]{1,5})\s+\d{4}',  # NVDA 2025
+                r'(?:ticker|symbol|stock):\s*([A-Z]{1,5})',  # ticker: NVDA
+            ]
+            
+            for pattern in ticker_patterns:
+                ticker_match = re.search(pattern, user_query, re.I)
+                if ticker_match:
+                    ticker_symbol = ticker_match.group(1).upper()
+                    logger.info(f"Extracted ticker symbol from query: {ticker_symbol}")
+                    break
+            
+            # If no pattern match, try looking for standalone uppercase words that might be tickers
+            if not ticker_symbol:
+                # Common company names to ticker mapping
+                company_to_ticker = {
+                    'apple': 'AAPL', 'microsoft': 'MSFT', 'google': 'GOOGL', 'alphabet': 'GOOGL',
+                    'amazon': 'AMZN', 'meta': 'META', 'facebook': 'META', 'nvidia': 'NVDA',
+                    'tesla': 'TSLA', 'netflix': 'NFLX', 'amd': 'AMD', 'intel': 'INTC',
+                    'salesforce': 'CRM', 'oracle': 'ORCL', 'adobe': 'ADBE', 'ibm': 'IBM',
+                    'cisco': 'CSCO',
+                }
+                
+                query_lower = user_query.lower()
+                for company, ticker in company_to_ticker.items():
+                    if company in query_lower:
+                        ticker_symbol = ticker
+                        logger.info(f"Identified ticker {ticker_symbol} from company name: {company}")
+                        break
+        
         # Build system prompt based on whether year and quarter were extracted
         has_year_and_quarter = requested_fiscal_year is not None and requested_quarter is not None
         
@@ -157,6 +193,10 @@ Your task is to:
 1. Identify the ticker symbol from the user's query
 2. You MAY use list_earnings_transcripts to verify the transcript is available, but this is optional
 3. The transcript_retriever will handle fetching the specific transcript
+
+IMPORTANT: Before calling any tools, briefly explain your reasoning. For example:
+- "The user provided {requested_fiscal_year} Q{requested_quarter}, so I should verify the transcript is available for this specific period"
+- "The user query mentions [company], which corresponds to ticker [TICKER]"
 
 Common ticker symbols:
 - AAPL = Apple
@@ -188,6 +228,10 @@ Your task is to:
 2. DO NOT use list_earnings_transcripts - skip it entirely
 3. The transcript_retriever will automatically fetch the MOST RECENT transcript
 
+IMPORTANT: Before proceeding, briefly explain your reasoning. For example:
+- "The user did not specify a fiscal quarter, so I'll let the transcript_retriever fetch the most recent transcript automatically"
+- "The user query mentions [company], which corresponds to ticker [TICKER]. Since no quarter was specified, I'll proceed to the next step"
+
 CRITICAL: Since no year/quarter was specified, DO NOT call list_earnings_transcripts. 
 The transcript_retriever will handle getting the latest transcript automatically.
 
@@ -216,12 +260,176 @@ DO NOT use list_earnings_transcripts - proceed directly to the next step.
         
         response = llm_with_tools.invoke(messages)
         
+        # Try to extract ticker from LLM response if we don't have it yet
+        # The LLM may mention the ticker in its reasoning
+        if not ticker_symbol and hasattr(response, 'content') and response.content:
+            content_str = str(response.content)
+            ticker_match = re.search(r'\b([A-Z]{1,5})\b', content_str)
+            if ticker_match:
+                potential_ticker = ticker_match.group(1)
+                # Check if it's a known ticker (common ones)
+                known_tickers = ['AAPL', 'MSFT', 'GOOGL', 'GOOG', 'AMZN', 'META', 'NVDA', 'TSLA', 'NFLX', 'AMD', 'INTC', 'CRM', 'ORCL', 'ADBE', 'IBM', 'CSCO']
+                if potential_ticker in known_tickers:
+                    ticker_symbol = potential_ticker
+                    logger.info(f"Extracted ticker {ticker_symbol} from LLM response")
+        
         return {
             "messages": [response],
             "current_stage": "analyzing_query",
             "requested_fiscal_year": requested_fiscal_year,
-            "requested_quarter": requested_quarter
+            "requested_quarter": requested_quarter,
+            "ticker_symbol": ticker_symbol or state.get("ticker_symbol"),  # Preserve existing or use extracted
         }
+    
+    async def check_embeddings(state: EarningsAgentState) -> Dict[str, Any]:
+        """Check if embeddings already exist for the requested fiscal year, quarter, and ticker."""
+        try:
+            # Check if transcript was already retrieved via tools (before we can check embeddings)
+            messages = state.get("messages", [])
+            transcript_already_retrieved = False
+            for msg in reversed(messages):
+                if isinstance(msg, ToolMessage):
+                    tool_name = getattr(msg, 'name', None)
+                    if tool_name == "get_earnings_transcript":
+                        transcript_already_retrieved = True
+                        logger.info("Transcript already retrieved via tools, will route to store_embeddings")
+                        break
+            
+            settings = get_settings()
+            if not getattr(settings, "rag_enabled", True):
+                logger.info("RAG is disabled, skipping embedding check")
+                message = AIMessage(content="RAG disabled. Retrieving transcript from website...")
+                return {
+                    "messages": [message],
+                    "current_stage": "retrieving_transcript",
+                    "embeddings_exist": False
+                }
+            
+            # Extract information from state
+            requested_fiscal_year = state.get("requested_fiscal_year")
+            requested_quarter = state.get("requested_quarter")
+            ticker_symbol = state.get("ticker_symbol")
+            
+            # Try to extract ticker from messages or company_query if not in state
+            if not ticker_symbol:
+                # First try company_query
+                company_query = state.get("company_query", "")
+                if company_query:
+                    # Remove fiscal year/quarter from query to find ticker
+                    query_clean = re.sub(r'FY\s*\d{4}|Q[1-4]|\d{4}', '', company_query, flags=re.I).strip()
+                    # Look for ticker-like patterns (1-5 uppercase letters, possibly preceded by $)
+                    ticker_patterns = [
+                        r'\$([A-Z]{1,5})\b',  # $NVDA
+                        r'\b([A-Z]{1,5})\b',  # NVDA (standalone uppercase word)
+                    ]
+                    for pattern in ticker_patterns:
+                        ticker_match = re.search(pattern, query_clean)
+                        if ticker_match:
+                            potential_ticker = ticker_match.group(1).upper()
+                            # Basic validation: common tickers are 1-5 uppercase letters
+                            if len(potential_ticker) <= 5 and potential_ticker.isalpha():
+                                ticker_symbol = potential_ticker
+                                logger.info(f"Extracted ticker {ticker_symbol} from company_query")
+                                break
+                
+                # Also check messages for ticker mentions
+                if not ticker_symbol:
+                    messages_list = list(state["messages"])
+                    for msg in reversed(messages_list):
+                        if hasattr(msg, 'content') and msg.content:
+                            content_str = str(msg.content)
+                            # Look for ticker in transcript metadata
+                            ticker_match = re.search(r'\*\*Company:\*\* ([A-Z]+)', content_str)
+                            if ticker_match:
+                                ticker_symbol = ticker_match.group(1)
+                                logger.info(f"Extracted ticker {ticker_symbol} from message")
+                                break
+            
+            # Only check if we have all three: ticker, fiscal_year, and quarter
+            if ticker_symbol and requested_fiscal_year and requested_quarter:
+                try:
+                    rag_service = get_rag_service()
+                    embeddings_exist = await rag_service.transcript_is_chunked(
+                        ticker_symbol=ticker_symbol,
+                        fiscal_year=requested_fiscal_year,
+                        quarter=requested_quarter,
+                    )
+                    
+                    if embeddings_exist:
+                        logger.info(f"Embeddings already exist for {ticker_symbol} FY{requested_fiscal_year} Q{requested_quarter}, skipping transcript retrieval")
+                        # Store metadata in state for use in summarizer
+                        # Add a message to make the stage visible - keep it as "retrieving_transcript" stage so "Retrieving Reports" is shown
+                        message = AIMessage(content=f"Found existing embeddings for {ticker_symbol} FY{requested_fiscal_year} Q{requested_quarter}. Using cached transcript data for analysis.")
+                        return {
+                            "messages": [message],
+                            "current_stage": "retrieving_transcript",  # Use retrieving_transcript so "Retrieving Reports" is shown
+                            "embeddings_exist": True,
+                            "ticker_symbol": ticker_symbol,
+                            "requested_fiscal_year": requested_fiscal_year,  # Preserve for summarizer
+                            "requested_quarter": requested_quarter,  # Preserve for summarizer
+                            "skip_transcript_retrieval": True,
+                        }
+                    else:
+                        logger.info(f"Embeddings do not exist for {ticker_symbol} FY{requested_fiscal_year} Q{requested_quarter}, will retrieve transcript")
+                        # Add a message to make the stage visible
+                        message = AIMessage(content=f"No existing embeddings found for {ticker_symbol} FY{requested_fiscal_year} Q{requested_quarter}. Retrieving transcript from website.")
+                        return {
+                            "messages": [message],
+                            "current_stage": "retrieving_transcript",
+                            "embeddings_exist": False,
+                            "ticker_symbol": ticker_symbol,
+                            "requested_fiscal_year": requested_fiscal_year,  # Preserve for store_embeddings
+                            "requested_quarter": requested_quarter,  # Preserve for store_embeddings
+                            "skip_transcript_retrieval": False,
+                        }
+                except Exception as e:
+                    logger.error(f"Error checking embeddings: {e}", exc_info=True)
+                    # On error, proceed with transcript retrieval
+                    message = AIMessage(content="Error checking database. Retrieving transcript from website...")
+                    return {
+                        "messages": [message],
+                        "current_stage": "retrieving_transcript",
+                        "embeddings_exist": False,
+                        "ticker_symbol": ticker_symbol,
+                        "skip_transcript_retrieval": False,
+                    }
+            else:
+                # Missing information - need to proceed with transcript retrieval
+                # This happens when user doesn't provide fiscal year/quarter (to get latest)
+                # OR when transcript was already retrieved via tools
+                if transcript_already_retrieved:
+                    logger.info(f"Transcript already retrieved via tools, routing to store_embeddings")
+                    message = AIMessage(content="Transcript retrieved. Preparing for analysis...")
+                    return {
+                        "messages": [message],
+                        "current_stage": "retrieving_transcript",  # Keep as retrieving_transcript to show "Retrieving Reports"
+                        "embeddings_exist": False,
+                        "ticker_symbol": ticker_symbol,
+                        "requested_fiscal_year": requested_fiscal_year,  # May be None
+                        "requested_quarter": requested_quarter,  # May be None
+                        "skip_transcript_retrieval": True,  # Signal that transcript is already retrieved
+                    }
+                else:
+                    logger.info(f"Cannot check embeddings: missing info. ticker={ticker_symbol}, year={requested_fiscal_year}, quarter={requested_quarter}. Will retrieve transcript.")
+                    # Add a message to make the stage visible
+                    message = AIMessage(content="Retrieving the latest earnings transcript from website...")
+                    return {
+                        "messages": [message],
+                        "current_stage": "retrieving_transcript",
+                        "embeddings_exist": False,
+                        "ticker_symbol": ticker_symbol,
+                        "requested_fiscal_year": requested_fiscal_year,  # May be None
+                        "requested_quarter": requested_quarter,  # May be None
+                        "skip_transcript_retrieval": False,
+                    }
+        except Exception as e:
+            logger.error(f"Error in check_embeddings node: {e}", exc_info=True)
+            # On error, proceed with transcript retrieval
+            return {
+                "current_stage": "retrieving_transcript",
+                "embeddings_exist": False,
+                "skip_transcript_retrieval": False,
+            }
     
     async def store_embeddings(state: EarningsAgentState) -> Dict[str, Any]:
         """Store transcript embeddings in database for RAG retrieval."""
@@ -318,15 +526,26 @@ DO NOT use list_earnings_transcripts - proceed directly to the next step.
                     requested_fiscal_year = period_match.group(1)
                     requested_quarter = period_match.group(2)
             
-            # If we have all required information, store embeddings
+            # Check if embeddings already exist before storing
             if transcript_body and ticker_symbol and requested_fiscal_year and requested_quarter:
                 try:
                     rag_service = get_rag_service()
                     
+                    # Check if embeddings already exist
+                    embeddings_exist = await rag_service.transcript_is_chunked(
+                        ticker_symbol=ticker_symbol,
+                        fiscal_year=requested_fiscal_year,
+                        quarter=requested_quarter,
+                    )
+                    
+                    if embeddings_exist:
+                        logger.info(f"Embeddings already exist for {ticker_symbol} FY{requested_fiscal_year} Q{requested_quarter}, skipping storage")
+                        return {"current_stage": "storing_embeddings"}
+                    
                     # Get company name (default to ticker if not available)
                     company_name = state.get("company_name") or ticker_symbol
                     
-                    # Store embeddings
+                    # Store embeddings (this will delete existing chunks first)
                     chunk_count = await rag_service.chunk_and_store_transcript(
                         transcript_content=transcript_body,
                         ticker_symbol=ticker_symbol,
@@ -412,6 +631,10 @@ Or you can simply say "Q1", "Q2", "Q3", or "Q4" and I'll use the fiscal year {re
 
 CRITICAL: The user has explicitly requested FY{requested_fiscal_year} Q{requested_quarter}. You MUST use these exact values.
 
+IMPORTANT: Before calling the tool, briefly explain your reasoning. For example:
+- "The user has requested FY{requested_fiscal_year} Q{requested_quarter} for [TICKER]. I'll fetch this specific transcript."
+- "I need to retrieve the transcript for [TICKER] for fiscal year {requested_fiscal_year}, quarter {requested_quarter}."
+
 RULES:
 1. Call get_earnings_transcript EXACTLY ONCE with:
    - symbol: The ticker symbol (extract from the conversation)
@@ -431,6 +654,11 @@ After calling get_earnings_transcript ONCE with fiscal_year="{requested_fiscal_y
 """
         else:
             system_prompt = """You are an expert at retrieving earnings transcripts from discountingcashflows.com.
+
+IMPORTANT: Before calling the tool, briefly explain your reasoning. For example:
+- "The user did not specify a fiscal quarter, so I'll fetch the most recent transcript for [TICKER]"
+- "No quarter was specified, so I'll retrieve the latest available transcript"
+- "I need to get the most recent earnings transcript for [TICKER] since no specific quarter was provided"
 
 CRITICAL RULES - READ CAREFULLY:
 1. Call get_earnings_transcript EXACTLY ONCE - NEVER call it multiple times
@@ -715,8 +943,38 @@ Generate a comprehensive summary covering all the key sections above.""")
         current_stage = state.get("current_stage", "analyzing_query")
         
         if current_stage == "analyzing_query":
-            return "transcript_retriever"
+            return "check_embeddings"
+        elif current_stage == "checking_embeddings":
+            # Check if transcript was already retrieved via tools (before embeddings check)
+            messages = state.get("messages", [])
+            transcript_already_retrieved = False
+            for msg in reversed(messages):
+                if isinstance(msg, ToolMessage):
+                    tool_name = getattr(msg, 'name', None)
+                    if tool_name == "get_earnings_transcript":
+                        transcript_already_retrieved = True
+                        break
+            
+            # Check if we should skip transcript retrieval
+            skip_transcript_retrieval = state.get("skip_transcript_retrieval", False)
+            if skip_transcript_retrieval:
+                if transcript_already_retrieved:
+                    # Transcript was just retrieved via tools, need to store embeddings
+                    return "store_embeddings"
+                else:
+                    # Embeddings exist in DB, skip to summarizer
+                    return "summarizer"
+            else:
+                # Embeddings don't exist, proceed with transcript retrieval
+                return "transcript_retriever"
         elif current_stage == "retrieving_transcript":
+            # Check if we should skip transcript retrieval (embeddings exist)
+            # Note: check_embeddings sets current_stage to "retrieving_transcript" when embeddings exist
+            skip_transcript_retrieval = state.get("skip_transcript_retrieval", False)
+            if skip_transcript_retrieval:
+                # Embeddings exist, skip to summarizer
+                return "summarizer"
+            
             # Check if transcript was already retrieved
             transcript_retrieved = False
             for msg in reversed(messages):
@@ -758,13 +1016,20 @@ Generate a comprehensive summary covering all the key sections above.""")
                     logger.info("Detected transcript retrieval, routing to store_embeddings")
                     break
         
-        # If transcript was retrieved, go to store_embeddings first, then summarizer
-        if transcript_retrieved:
-            return "store_embeddings"
-        
         # Stay in current stage to process tool results
         if current_stage == "analyzing_query":
-            return "query_analyzer"
+            # After query_analyzer tools complete, route to check_embeddings
+            # This allows check_embeddings to run and emit "Retrieving Reports" stage update
+            # even when transcript was already retrieved via tools
+            # (check_embeddings will handle the case when info is missing and route appropriately)
+            return "check_embeddings"
+        
+        # If transcript was retrieved (after check_embeddings), go to store_embeddings
+        if transcript_retrieved:
+            return "store_embeddings"
+        elif current_stage == "checking_embeddings":
+            # After tools in checking_embeddings, go back to check_embeddings to re-evaluate
+            return "check_embeddings"
         elif current_stage == "retrieving_transcript":
             # If we're in retrieving_transcript stage and haven't retrieved yet, stay here
             # But if we've already retrieved, go to store_embeddings
@@ -783,6 +1048,7 @@ Generate a comprehensive summary covering all the key sections above.""")
     
     # Add nodes
     workflow.add_node("query_analyzer", query_analyzer)
+    workflow.add_node("check_embeddings", check_embeddings)
     workflow.add_node("transcript_retriever", transcript_retriever)
     workflow.add_node("store_embeddings", store_embeddings)
     workflow.add_node("summarizer", summarizer)
@@ -797,7 +1063,19 @@ Generate a comprehensive summary covering all the key sections above.""")
         should_use_tools,
         {
             "tools": "tools",
-            "transcript_retriever": "transcript_retriever",
+            "check_embeddings": "check_embeddings",
+            "end": END
+        }
+    )
+    
+    # Add conditional edges from check_embeddings
+    workflow.add_conditional_edges(
+        "check_embeddings",
+        should_use_tools,
+        {
+            "summarizer": "summarizer",  # Embeddings exist in DB, skip transcript retrieval
+            "store_embeddings": "store_embeddings",  # Transcript was just retrieved via tools, need to store
+            "transcript_retriever": "transcript_retriever",  # Embeddings don't exist, proceed
             "end": END
         }
     )
@@ -818,6 +1096,7 @@ Generate a comprehensive summary covering all the key sections above.""")
         after_tools,
         {
             "query_analyzer": "query_analyzer",
+            "check_embeddings": "check_embeddings",
             "transcript_retriever": "transcript_retriever",
             "store_embeddings": "store_embeddings",
         }
@@ -936,15 +1215,179 @@ async def stream_earnings_analysis(company_query: str):
     
     # Stream the agent execution
     final_result = None
+    current_state = initial_state.copy()
     async for event in agent.astream(initial_state):
         # Yield each step's updates
         for node_name, node_output in event.items():
-            current_stage = node_output.get("current_stage", "processing")
-            summary = node_output.get("summary")
+            # Update current state with node output (state is cumulative)
+            for key, value in node_output.items():
+                if key == "messages" and value:
+                    # Messages are appended, so merge them
+                    if isinstance(value, list):
+                        existing_messages = current_state.get(key, [])
+                        current_state[key] = list(existing_messages) + value
+                else:
+                    current_state[key] = value
+            
+            current_stage = node_output.get("current_stage") or current_state.get("current_stage", "processing")
+            summary = node_output.get("summary") or current_state.get("summary")
+            
+            # Log node execution for debugging
+            logger.debug(f"Processing node: {node_name}, current_stage: {current_stage}, has_messages: {bool(node_output.get('messages'))}")
+            
+            # Extract reasoning from the AI message specific to this node
+            # Each node produces its own AIMessage, so we need to find the one from this node
+            reasoning = None
+            
+            # Strategy: Check node_output messages first - these are the messages just produced by this node
+            new_messages = node_output.get("messages", [])
+            
+            # Priority 1: Check new messages from this node (these are definitely from this node)
+            messages_to_check = []
+            if new_messages:
+                # Filter to only AIMessages
+                for msg in new_messages:
+                    if isinstance(msg, AIMessage):
+                        messages_to_check.append(msg)
+                        logger.debug(f"Found AIMessage in node_output for {node_name}")
+            
+            # Priority 2: If no AIMessage in node_output, look in state messages
+            # But be smart about which messages belong to which node
+            if not messages_to_check:
+                all_messages = current_state.get("messages", [])
+                
+                if node_name == "query_analyzer":
+                    # query_analyzer produces the first AIMessage (after HumanMessage)
+                    # Look for first AIMessage that doesn't have get_earnings_transcript tool calls
+                    for msg in all_messages:
+                        if isinstance(msg, AIMessage):
+                            # Check if it has transcript tool calls (if so, it's from transcript_retriever)
+                            has_transcript_tool = False
+                            if hasattr(msg, 'tool_calls') and msg.tool_calls:
+                                for tc in msg.tool_calls:
+                                    tool_name = None
+                                    if isinstance(tc, dict):
+                                        tool_name = tc.get('name', '')
+                                    elif hasattr(tc, 'name'):
+                                        tool_name = tc.name
+                                    if tool_name == 'get_earnings_transcript':
+                                        has_transcript_tool = True
+                                        break
+                            if not has_transcript_tool:
+                                messages_to_check.append(msg)
+                                break
+                
+                elif node_name == "transcript_retriever":
+                    # transcript_retriever produces AIMessage with get_earnings_transcript tool calls
+                    # Priority: Check node_output messages first (these are from this node)
+                    if new_messages:
+                        for msg in new_messages:
+                            if isinstance(msg, AIMessage):
+                                messages_to_check.append(msg)
+                                logger.debug(f"Found transcript_retriever AIMessage in node_output")
+                                break
+                    
+                    # Fallback: Check state messages for AIMessage with get_earnings_transcript tool calls
+                    if not messages_to_check:
+                        for msg in reversed(all_messages):
+                            if isinstance(msg, AIMessage):
+                                # Check if this message has get_earnings_transcript tool calls
+                                has_transcript_tool = False
+                                if hasattr(msg, 'tool_calls') and msg.tool_calls:
+                                    for tc in msg.tool_calls:
+                                        tool_name = None
+                                        if isinstance(tc, dict):
+                                            tool_name = tc.get('name', '')
+                                        elif hasattr(tc, 'name'):
+                                            tool_name = tc.name
+                                        if tool_name == 'get_earnings_transcript':
+                                            has_transcript_tool = True
+                                            break
+                                if has_transcript_tool:
+                                    messages_to_check.append(msg)
+                                    logger.debug(f"Found transcript_retriever AIMessage in state messages")
+                                    break
+                
+                elif node_name == "summarizer":
+                    # summarizer produces the last AIMessage without tool calls
+                    # Check node_output first (most recent)
+                    for msg in reversed(all_messages):
+                        if isinstance(msg, AIMessage):
+                            # Summarizer messages typically don't have tool calls
+                            if not (hasattr(msg, 'tool_calls') and msg.tool_calls):
+                                messages_to_check.append(msg)
+                                # For summarizer, we want to show a brief reasoning, not the full summary
+                                # Extract just the first part as reasoning
+                                break
+                
+                elif node_name == "store_embeddings":
+                    # store_embeddings doesn't produce AIMessages, skip reasoning
+                    pass
+            
+            logger.debug(f"Checking {len(messages_to_check)} messages for {node_name}, node_output had {len(new_messages)} messages")
+            
+            for msg in messages_to_check:
+                if isinstance(msg, AIMessage):
+                    # Extract reasoning/thinking from AI message content
+                    content = msg.content if hasattr(msg, 'content') else ""
+                    content_str = str(content) if content else ""
+                    
+                    # Check if this message has tool calls
+                    has_tool_calls = hasattr(msg, 'tool_calls') and msg.tool_calls and len(msg.tool_calls) > 0
+                    
+                    # Extract tool names if present
+                    tool_names = []
+                    if has_tool_calls:
+                        for tc in msg.tool_calls:
+                            if isinstance(tc, dict):
+                                tool_name = tc.get('name', 'tool')
+                                if tool_name:
+                                    tool_names.append(tool_name)
+                            elif hasattr(tc, 'name'):
+                                if tc.name:
+                                    tool_names.append(tc.name)
+                    
+                    # Build reasoning from content and/or tool calls
+                    if content_str and content_str.strip():
+                        # Skip very long content (likely tool results)
+                        if len(content_str) > 5000:
+                            continue
+                        
+                        # For messages with reasoning but no tool calls
+                        if not has_tool_calls:
+                            # Plain reasoning message
+                            if node_name == "summarizer":
+                                # For summarizer, extract a brief reasoning from the start of the summary
+                                # Take first 500 chars as reasoning (the summary itself is the output)
+                                if len(content_str) > 500:
+                                    reasoning = content_str[:500] + "...\n\n[Generating comprehensive summary from transcript]"
+                                else:
+                                    reasoning = content_str
+                            elif len(content_str) < 3000:
+                                reasoning = content_str
+                        else:
+                            # Message with tool calls - prioritize the reasoning content
+                            # The content should contain the reasoning, tool calls are just metadata
+                            if len(content_str) < 3000:
+                                # Use the content as reasoning (it should contain the LLM's explanation)
+                                reasoning = content_str
+                            elif len(content_str) >= 3000:
+                                # Very long content - might be tool results, skip
+                                continue
+                    elif has_tool_calls and tool_names:
+                        # No content but has tool calls - this shouldn't happen with updated prompts
+                        # but if it does, show what tools are being called
+                        reasoning = f"Preparing to call tools: {', '.join(tool_names)}"
+                    
+                    # Only use the first reasonable message we find
+                    if reasoning:
+                        logger.info(f"Extracted reasoning for {node_name} stage {current_stage}: {reasoning[:100]}...")
+                        break
             
             # Map internal stages to user-friendly stages
             stage_mapping = {
                 "analyzing_query": "analyzing_query",
+                "checking_embeddings": "checking_embeddings",
                 "retrieving_transcript": "retrieving_transcript",
                 "storing_embeddings": "storing_embeddings",
                 "complete": "complete",
@@ -956,8 +1399,12 @@ async def stream_earnings_analysis(company_query: str):
                 "has_summary": summary is not None,
                 "summary": summary,
                 "messages": node_output.get("messages", []),
+                "reasoning": reasoning,  # Add reasoning to update
             }
             
+            # Always yield update for all nodes (tools node is filtered out in routes.py)
+            # This ensures we capture transcript_retriever even if reasoning extraction fails
+            logger.info(f"Yielding update for {node_name}: stage={update['stage']}, current_stage={current_stage}, has_reasoning={bool(reasoning)}")
             yield update
             
             # Keep track of final result
