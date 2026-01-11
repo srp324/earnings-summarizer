@@ -1229,6 +1229,42 @@ async def stream_earnings_analysis(company_query: str):
                     current_state[key] = value
             
             current_stage = node_output.get("current_stage") or current_state.get("current_stage", "processing")
+            
+            # Special handling for tools node: if it's retrieving transcripts, use retrieving_transcript stage
+            if node_name == "tools" and current_stage == "analyzing_query":
+                # Check if previous message (from query_analyzer) has transcript-related tool calls
+                # Also check new messages from tools node (ToolMessage) to detect which tools were executed
+                all_messages = current_state.get("messages", [])
+                new_messages = node_output.get("messages", [])
+                
+                # Check for transcript-related tool calls in AIMessage
+                for msg in reversed(all_messages):
+                    if isinstance(msg, AIMessage):
+                        if hasattr(msg, 'tool_calls') and msg.tool_calls:
+                            for tc in msg.tool_calls:
+                                tool_name = None
+                                if isinstance(tc, dict):
+                                    tool_name = tc.get('name', '')
+                                elif hasattr(tc, 'name'):
+                                    tool_name = tc.name
+                                if tool_name in ['get_earnings_transcript', 'list_earnings_transcripts']:
+                                    # Transcript retrieval/listing is happening, use retrieving_transcript stage
+                                    current_stage = "retrieving_transcript"
+                                    logger.info(f"Detected transcript operation ({tool_name}) in tools node, using retrieving_transcript stage")
+                                    break
+                        if current_stage == "retrieving_transcript":
+                            break
+                
+                # Also check ToolMessages from tools node execution to detect transcript operations
+                if current_stage != "retrieving_transcript":
+                    for msg in new_messages:
+                        if isinstance(msg, ToolMessage):
+                            tool_name = getattr(msg, 'name', None)
+                            if tool_name in ['get_earnings_transcript', 'list_earnings_transcripts']:
+                                current_stage = "retrieving_transcript"
+                                logger.info(f"Detected transcript operation ({tool_name}) in tools node output, using retrieving_transcript stage")
+                                break
+            
             summary = node_output.get("summary") or current_state.get("summary")
             
             # Log node execution for debugging

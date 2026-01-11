@@ -135,9 +135,10 @@ function App() {
                   }
                 } else if (data.type === 'reasoning') {
                   // Reasoning event - show AI reasoning as a visible step
+                  // Also mark the stage as active when reasoning is received
                   const stageId = data.stage_id
                   const reasoning = data.reasoning
-                  
+
                   console.log(`[Reasoning Event] ${stageId}:`, {
                     stage_label: data.stage_label,
                     node: data.node,
@@ -145,7 +146,10 @@ function App() {
                     reasoning_preview: reasoning ? reasoning.substring(0, 100) : null
                   })
                   
-                  // Update the stage with reasoning
+                  // Mark as analyzing when reasoning is received (stage is active)
+                  setIsAnalyzing(true)
+                  
+                  // Update the stage with reasoning and mark as active
                   if (reasoning && reasoning.trim()) {
                     setCurrentStages(prev => {
                       const updated = prev.map(s => {
@@ -158,6 +162,7 @@ function App() {
                           return {
                             ...s,
                             label: data.stage_label || s.label,
+                            status: 'active' as const, // Mark as active when reasoning is received
                             reasoning: reasoning
                           }
                         }
@@ -625,9 +630,6 @@ function App() {
                             )
                           })}
                         </div>
-                        <p className="text-slate-400 text-sm">
-                          Analyzing earnings reports...
-                        </p>
                       </>
                     ) : (
                       /* Simple loading indicator for chat */

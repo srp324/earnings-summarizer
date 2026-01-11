@@ -308,11 +308,18 @@ async def chat_stream(
                     # Log all updates from stream for debugging
                     logger.info(f"Received update from stream: node={node}, stage={stage}")
                     
-                    # Skip stage updates for "tools" node - it doesn't represent a stage
-                    # The previous stage (e.g., "Retrieving Reports") should remain active during tool execution
+                    # For "tools" node, only skip if it's not retrieving transcripts
+                    # Transcript retrieval should show "Retrieving Reports" stage
                     if node == "tools":
-                        logger.debug(f"Skipping stage update for tools node (previous stage '{current_active_stage_id}' remains active)")
-                        continue
+                        # Check if stage is "retrieving_transcript" - if so, process it to show "Retrieving Reports"
+                        if stage == "retrieving_transcript":
+                            # This is transcript retrieval, process it to show "Retrieving Reports"
+                            logger.debug(f"Processing tools node update for transcript retrieval (stage: {stage})")
+                            # Continue processing - don't skip
+                        else:
+                            # Not transcript retrieval, skip it
+                            logger.debug(f"Skipping stage update for tools node (stage: {stage}, previous stage '{current_active_stage_id}' remains active)")
+                            continue
                     
                     # Skip if stage is "processing" and not in our mapping (invalid stage)
                     if stage == "processing" and stage not in stage_mapping:
