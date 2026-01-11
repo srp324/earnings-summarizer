@@ -55,6 +55,9 @@ dist/
 # Logs
 *.log
 
+# LangGraph
+.langgraph_api/
+
 # OS
 .DS_Store
 Thumbs.db
