@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
-import { Send, TrendingUp, Loader2, Sparkles, BarChart3, FileText, Search, CheckCircle, AlertCircle, ChevronDown, ChevronUp } from 'lucide-react'
+import { Send, TrendingUp, Loader2, Sparkles, BarChart3, Search, CheckCircle, AlertCircle, ChevronDown, ChevronUp } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 
 interface Message {
@@ -8,6 +8,7 @@ interface Message {
   role: 'user' | 'assistant' | 'system'
   content: string
   timestamp: Date
+  stages?: AnalysisStage[] // Optional stage flow data for analysis messages
 }
 
 interface AnalysisStage {
@@ -34,6 +35,7 @@ function App() {
   const [isAnalyzing, setIsAnalyzing] = useState(false)
   const [expandedStages, setExpandedStages] = useState<Set<string>>(new Set())
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  const stagesRef = useRef<AnalysisStage[]>(stages)
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -43,18 +45,10 @@ function App() {
     scrollToBottom()
   }, [messages])
 
-  const updateStage = (stageId: string, status: 'pending' | 'active' | 'complete' | 'error', reasoning?: string) => {
-    setCurrentStages(prev => prev.map(s => 
-      s.id === stageId ? { 
-        ...s, 
-        status,
-        reasoning: reasoning !== undefined ? reasoning : s.reasoning  // Preserve existing reasoning if not provided
-      } : s
-    ))
-  }
-
   const resetStages = () => {
-    setCurrentStages(stages.map(s => ({ ...s, status: 'pending' as const, reasoning: undefined })))
+    const reset = stages.map(s => ({ ...s, status: 'pending' as const, reasoning: undefined }))
+    stagesRef.current = reset
+    setCurrentStages(reset)
     setExpandedStages(new Set())
   }
   
@@ -153,28 +147,34 @@ function App() {
                   
                   // Update the stage with reasoning
                   if (reasoning && reasoning.trim()) {
-                    setCurrentStages(prev => prev.map(s => {
-                      if (s.id === stageId) {
-                        const hasNewReasoning = !s.reasoning
-                        // Auto-expand reasoning when it first appears
-                        if (hasNewReasoning) {
-                          setExpandedStages(prevExpanded => new Set([...prevExpanded, stageId]))
+                    setCurrentStages(prev => {
+                      const updated = prev.map(s => {
+                        if (s.id === stageId) {
+                          const hasNewReasoning = !s.reasoning
+                          // Auto-expand reasoning when it first appears
+                          if (hasNewReasoning) {
+                            setExpandedStages(prevExpanded => new Set([...prevExpanded, stageId]))
+                          }
+                          return {
+                            ...s,
+                            label: data.stage_label || s.label,
+                            reasoning: reasoning
+                          }
                         }
-                        return {
-                          ...s,
-                          label: data.stage_label || s.label,
-                          reasoning: reasoning
-                        }
-                      }
-                      return s
-                    }))
+                        return s
+                      })
+                      stagesRef.current = updated
+                      return updated
+                    })
                   }
                 } else if (data.type === 'stage_update') {
                   // Stage update - update UI in real-time
                   setIsAnalyzing(true)
                   const stageId = data.stage_id
-                  const status = data.status === 'active' ? 'active' : 
-                                data.status === 'complete' ? 'complete' : 'pending'
+                  const status: 'pending' | 'active' | 'complete' | 'error' = 
+                    data.status === 'active' ? 'active' : 
+                    data.status === 'complete' ? 'complete' : 
+                    data.status === 'error' ? 'error' : 'pending'
                   const reasoning = data.reasoning  // Capture reasoning from backend
                   
                   // Debug logging - log ALL stage updates
@@ -189,7 +189,7 @@ function App() {
                   
                   // Update the specific stage with label and reasoning if provided by backend
                   setCurrentStages(prev => {
-                    return prev.map((s) => {
+                    const updated = prev.map((s) => {
                       if (s.id === stageId) {
                         // Update the target stage
                         const hasNewReasoning = reasoning !== undefined && reasoning !== null && reasoning.trim().length > 0
@@ -212,6 +212,8 @@ function App() {
                       // for previous stages when transitioning to new stages
                       return s
                     })
+                    stagesRef.current = updated
+                    return updated
                   })
                 } else if (data.type === 'complete') {
                   // Final result received
@@ -219,11 +221,33 @@ function App() {
                   receivedSessionId = data.session_id || receivedSessionId
                   actionTaken = data.action_taken || 'chat'
                   
-                  // Mark all stages as complete if this was an analysis
+                  // If this was an analysis, create a message with the stage flow before hiding it
                   if (actionTaken === 'analysis_triggered') {
-                    stages.forEach(stage => {
-                      updateStage(stage.id, 'complete')
-                    })
+                    // Capture current stages from ref
+                    const currentStagesSnapshot = stagesRef.current
+                    
+                    // Create completed stages for the message
+                    const completedStages: AnalysisStage[] = currentStagesSnapshot.map(s => ({
+                      ...s,
+                      status: 'complete' as const,
+                      icon: s.icon // Keep icon reference
+                    }))
+                    
+                    // Create a message with the stage flow
+                    const stageFlowMessage: Message = {
+                      id: `stage-flow-${Date.now()}`,
+                      role: 'assistant',
+                      content: '', // Empty content - we'll render stages instead
+                      timestamp: new Date(),
+                      stages: completedStages
+                    }
+                    
+                    // Add the stage flow message
+                    setMessages(prevMessages => [...prevMessages, stageFlowMessage])
+                    
+                    // Mark stages as complete
+                    setCurrentStages(completedStages)
+                    stagesRef.current = completedStages
                     setIsAnalyzing(false)
                   }
                 } else if (data.type === 'error') {
@@ -232,9 +256,13 @@ function App() {
                   
                   // Update stages to show error
                   if (isAnalyzing) {
-                    setCurrentStages(prev => prev.map(s => 
-                      s.status === 'active' ? { ...s, status: 'error' as const } : s
-                    ))
+                    setCurrentStages(prev => {
+                      const updated = prev.map(s => 
+                        s.status === 'active' ? { ...s, status: 'error' as const } : s
+                      )
+                      stagesRef.current = updated
+                      return updated
+                    })
                     setIsAnalyzing(false)
                   }
                 }
@@ -300,9 +328,13 @@ function App() {
       
       // Update stages to show error if we were analyzing
       if (isAnalyzing) {
-        setCurrentStages(prev => prev.map(s => 
-          s.status === 'active' ? { ...s, status: 'error' as const } : s
-        ))
+        setCurrentStages(prev => {
+          const updated = prev.map(s => 
+            s.status === 'active' ? { ...s, status: 'error' as const } : s
+          )
+          stagesRef.current = updated
+          return updated
+        })
         setIsAnalyzing(false)
       }
     } finally {
@@ -384,30 +416,123 @@ function App() {
                 </motion.div>
               )}
 
-              {messages.map((message) => (
-                <motion.div
-                  key={message.id}
-                  initial={{ opacity: 0, y: 20 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  className={`flex ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}
-                >
-                  <div
-                    className={`max-w-[85%] rounded-2xl px-5 py-4 ${
-                      message.role === 'user'
-                        ? 'bg-gradient-to-br from-ocean-600 to-ocean-700 text-white'
-                        : 'bg-slate-800/80 text-slate-100'
-                    }`}
+              {messages.map((message) => {
+                // Check if this message has stage flow data
+                const hasStageFlow = message.stages && message.stages.length > 0
+                
+                return (
+                  <motion.div
+                    key={message.id}
+                    initial={{ opacity: 0, y: 20 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    className={`flex ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}
                   >
-                    {message.role === 'assistant' ? (
-                      <div className="markdown-content">
-                        <ReactMarkdown>{message.content}</ReactMarkdown>
-                      </div>
-                    ) : (
-                      <p className="text-lg">{message.content}</p>
-                    )}
-                  </div>
-                </motion.div>
-              ))}
+                    <div
+                      className={`max-w-[85%] rounded-2xl px-5 py-4 ${
+                        message.role === 'user'
+                          ? 'bg-gradient-to-br from-ocean-600 to-ocean-700 text-white'
+                          : 'bg-slate-800/80 text-slate-100'
+                      }`}
+                    >
+                      {message.role === 'assistant' && hasStageFlow ? (
+                        // Render stage flow message
+                        <div className="space-y-3">
+                          {message.stages!.map((stage, index) => {
+                            const stageKey = `${message.id}-${stage.id}`
+                            const isExpanded = expandedStages.has(stageKey)
+                            const hasReasoning = stage.reasoning && stage.reasoning.trim().length > 0
+                            
+                            const toggleStageReasoning = () => {
+                              setExpandedStages(prev => {
+                                const newSet = new Set(prev)
+                                if (newSet.has(stageKey)) {
+                                  newSet.delete(stageKey)
+                                } else {
+                                  newSet.add(stageKey)
+                                }
+                                return newSet
+                              })
+                            }
+                            
+                            return (
+                              <motion.div
+                                key={stage.id}
+                                initial={{ opacity: 0, x: -10 }}
+                                animate={{ opacity: 1, x: 0 }}
+                                transition={{ delay: index * 0.1 }}
+                                className="space-y-2"
+                              >
+                                <div className={`flex items-center gap-3 ${
+                                  stage.status === 'active' ? 'text-ocean-400' :
+                                  stage.status === 'complete' ? 'text-emerald-400' :
+                                  stage.status === 'error' ? 'text-coral-500' :
+                                  'text-slate-500'
+                                }`}>
+                                  <div className="relative">
+                                    {stage.status === 'active' ? (
+                                      <Loader2 className="w-4 h-4 animate-spin" />
+                                    ) : stage.status === 'complete' ? (
+                                      <CheckCircle className="w-4 h-4" />
+                                    ) : stage.status === 'error' ? (
+                                      <AlertCircle className="w-4 h-4" />
+                                    ) : (
+                                      stage.icon
+                                    )}
+                                  </div>
+                                  <span className="text-sm font-medium flex-1">{stage.label}</span>
+                                  {hasReasoning ? (
+                                    <button
+                                      onClick={toggleStageReasoning}
+                                      className={`ml-2 p-1.5 rounded transition-colors flex items-center gap-1 ${
+                                        isExpanded 
+                                          ? 'bg-slate-700/70 hover:bg-slate-600/70 text-ocean-300' 
+                                          : 'hover:bg-slate-700/50 text-slate-400 hover:text-ocean-400'
+                                      }`}
+                                      title={isExpanded ? "Hide reasoning" : "Show AI reasoning"}
+                                    >
+                                      <span className="text-xs font-medium">
+                                        {isExpanded ? 'Hide' : 'Show'} Reasoning
+                                      </span>
+                                      {isExpanded ? (
+                                        <ChevronUp className="w-3.5 h-3.5" />
+                                      ) : (
+                                        <ChevronDown className="w-3.5 h-3.5" />
+                                      )}
+                                    </button>
+                                  ) : null}
+                                </div>
+                                
+                                {/* Reasoning section - expandable */}
+                                {hasReasoning && isExpanded && (
+                                  <motion.div
+                                    initial={{ opacity: 0, height: 0 }}
+                                    animate={{ opacity: 1, height: 'auto' }}
+                                    exit={{ opacity: 0, height: 0 }}
+                                    className="ml-7 mt-2 p-3 rounded-lg bg-slate-900/50 border border-slate-700/50"
+                                  >
+                                    <div className="text-xs font-semibold text-slate-400 mb-2 uppercase tracking-wide">
+                                      AI Reasoning
+                                    </div>
+                                    <div className="text-sm text-slate-300 whitespace-pre-wrap break-words">
+                                      {stage.reasoning}
+                                    </div>
+                                  </motion.div>
+                                )}
+                              </motion.div>
+                            )
+                          })}
+                        </div>
+                      ) : message.role === 'assistant' ? (
+                        <div className="markdown-content">
+                          <ReactMarkdown>{message.content}</ReactMarkdown>
+                        </div>
+                      ) : (
+                        <p className="text-lg">{message.content}</p>
+                      )}
+                    </div>
+                  </motion.div>
+                )
+              })}
 
               {isLoading && (
                 <motion.div
