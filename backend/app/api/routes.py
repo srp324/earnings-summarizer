@@ -406,6 +406,10 @@ async def chat_stream(
                     "summary": result.get("summary"),
                     "messages": result.get("messages", []),
                     "timestamp": datetime.utcnow().isoformat(),
+                    "ticker_symbol": result.get("ticker_symbol"),
+                    "company_name": result.get("company_name"),
+                    "requested_fiscal_year": result.get("requested_fiscal_year"),
+                    "requested_quarter": result.get("requested_quarter"),
                 }
                 session.set_analysis(analysis_data)
                 
@@ -590,6 +594,10 @@ async def chat(
                 "summary": result.get("summary"),
                 "messages": result.get("messages", []),
                 "timestamp": datetime.utcnow().isoformat(),
+                "ticker_symbol": result.get("ticker_symbol"),
+                "company_name": result.get("company_name"),
+                "requested_fiscal_year": result.get("requested_fiscal_year"),
+                "requested_quarter": result.get("requested_quarter"),
             }
             session.set_analysis(analysis_data)
             

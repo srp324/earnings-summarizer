@@ -9,12 +9,13 @@ This agent determines whether user input should:
 
 from typing import Dict, Any, Optional, List
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
 import re
 
 from app.config import get_settings
+from app.tools.investor_relations import TranscriptListTool
 
 
 class IntentClassification(BaseModel):
@@ -61,11 +62,20 @@ Your job is to classify user input into one of these categories:
 3. **clarification**: User wants to REFINE or CHANGE parameters of current analysis
    - Examples: "Actually, I meant the Q2 report", "Can you include more detail?"
 
-4. **general_chat**: General conversation not related to earnings
+4. **general_chat**: General conversation not related to earnings, OR sector/industry queries
    - Examples: "How are you?", "What can you do?", "Help"
+   - Sector names: "technology", "energy", "finance", "healthcare", "retail", "energy", etc.
+   - When user responds to a question asking about sectors (for example, "energy" after being asked 
+     "which sector?") = general_chat
+   - Questions about which companies have recent earnings in a sector = general_chat
+   - "Who had recent earnings reports?" with sector specification = general_chat
 
 CRITICAL CONTEXT AWARENESS:
 - ALWAYS look at the conversation history to understand context
+- Sector names (technology, energy, finance, healthcare, retail, etc.) are NOT companies - 
+  classify as 'general_chat' NOT 'new_analysis'
+- If the previous assistant message asked "which sector?" or "what sector are you interested in?" 
+  and user responds with a sector name (e.g., "energy", "technology"), classify as 'general_chat'
 - If user says "Q1", "Q2", etc. and previous messages mention a company and year, 
   this is a continuation/new_analysis that should combine the information
 - If user says "NVDA 2022" and then "Q1", the second message should be classified as 
@@ -75,7 +85,7 @@ CRITICAL CONTEXT AWARENESS:
 - If a user answers "yes", "sure", "okay" etc. to a question about deeper analysis, 
   classify as 'follow_up_question' NOT 'new_analysis'
 - Be contextually aware - "yes" after asking about deeper dive = follow_up_question
-- Look for company names, ticker symbols for new_analysis
+- Look for company names, ticker symbols for new_analysis (NOT sector names)
 - Short affirmative responses during conversation = follow_up_question
 
 Return your classification with confidence and reasoning. If the current input is incomplete 
@@ -297,26 +307,72 @@ async def create_chat_response(
         AI-generated response
     """
     settings = get_settings()
+    
+    last_analysis = context.get("last_analysis")
+    conversation_history = context.get("conversation_history", [])
+    
+    # Initialize tools for chat responses (to fetch real earnings data)
+    transcript_list_tool = TranscriptListTool()
+    chat_tools = [transcript_list_tool]
+    
+    # Bind tools to LLM for general_chat and default cases
     llm = ChatOpenAI(
         model=settings.llm_model,
         temperature=0.7,
         api_key=settings.openai_api_key,
     )
-    
-    last_analysis = context.get("last_analysis")
-    conversation_history = context.get("conversation_history", [])
+    llm_with_tools = llm.bind_tools(chat_tools) if chat_tools else llm
     
     if intent == "follow_up_question" and last_analysis:
-        # Answer based on existing analysis
-        system_msg = f"""You are a helpful assistant analyzing earnings reports.
+        # Use stored metadata from the analysis (ticker, fiscal year, quarter, company name)
+        ticker_symbol = last_analysis.get("ticker_symbol")
+        company_name = last_analysis.get("company_name")
+        requested_fiscal_year = last_analysis.get("requested_fiscal_year")
+        requested_quarter = last_analysis.get("requested_quarter")
+        summary = last_analysis.get("summary", "")
+        
+        # Build context description from stored metadata
+        context_parts = []
+        if ticker_symbol:
+            context_parts.append(f"ticker symbol {ticker_symbol}")
+        if company_name:
+            context_parts.append(f"company {company_name}")
+        elif ticker_symbol:
+            # If no company_name but we have ticker, use ticker as identifier
+            context_parts.append(f"company ({ticker_symbol})")
+        
+        if requested_fiscal_year and requested_quarter:
+            context_parts.append(f"fiscal year {requested_fiscal_year}, quarter {requested_quarter}")
+        elif requested_fiscal_year:
+            context_parts.append(f"fiscal year {requested_fiscal_year}")
+        
+        context_desc = ", ".join(context_parts) if context_parts else last_analysis.get("company_query", "")
+        
+        # Answer based on existing analysis if we have a summary
+        if summary:
+            context_info = f"\n\nThe analysis is for {context_desc}." if context_desc else ""
+            system_msg = f"""You are a helpful assistant analyzing earnings reports.
 
-You previously analyzed a company and provided this summary:
+There is an earnings report analysis available with the following summary:
 
-{last_analysis.get('summary', 'No summary available')}
+{summary}
+{context_info}
 
-Based on this analysis, answer the user's follow-up question. Be specific and reference 
-details from the analysis. If the question asks for information not in the analysis, 
-politely explain that and offer to provide what information is available."""
+IMPORTANT: Answer the user's question based on this analysis. You already have the context 
+- the company ({context_desc}), the fiscal period, and the detailed summary above.
+
+Answer the user's question directly using information from this analysis. Be specific and 
+reference details from the analysis. Do NOT ask which company or earnings report they're 
+referring to - you already have this context.
+
+If the question asks for information not in the analysis, politely explain that and offer 
+to provide what information is available from the analysis."""
+        else:
+            # No summary available - use conversation history instead
+            system_msg = """You are a helpful assistant analyzing earnings reports.
+
+Answer the user's question based on the conversation history below. Use the context from 
+previous messages to understand what earnings report is being discussed."""
         
         messages = [SystemMessage(content=system_msg)]
         
@@ -329,17 +385,44 @@ politely explain that and offer to provide what information is available."""
         
         messages.append(HumanMessage(content=user_input))
         
+        # Use regular LLM for follow-up questions (no tools needed)
+        response = await llm.ainvoke(messages)
+        return response.content
+        
     elif intent == "general_chat":
-        # General conversation
+        # General conversation with tool access
         system_msg = """You are a helpful AI assistant for an earnings analysis system.
         
 You can help users:
-- Analyze earnings reports for any public company
-- Answer questions about earnings summaries
-- Provide deeper insights into specific aspects of earnings reports
+- Analyze earnings reports for any public company (when they provide a company name or ticker)
+- Answer questions about earnings summaries (if they've already been generated)
+- Provide deeper insights into specific aspects of earnings reports (if they've already been analyzed)
+- Find which companies have recent earnings reports available
 
-Be friendly and concise. If users want to analyze a company, ask for the company 
-name or ticker symbol."""
+IMPORTANT: You have access to the list_earnings_transcripts tool that can fetch real earnings 
+transcript data from discountingcashflows.com for any ticker symbol.
+
+When asked about recent earnings reports (e.g., "Who had recent earning reports?" or "technology companies"):
+1. Use the list_earnings_transcripts tool to check recent earnings for relevant companies
+2. For sector-based questions (like "technology"), identify major companies in that sector:
+   - Technology: AAPL, MSFT, GOOGL, NVDA, META, TSLA, NFLX, AMD, INTC, CRM, ORCL, ADBE, IBM, CSCO
+   - Finance: JPM, BAC, GS, MS, C, WFC
+   - Retail: AMZN, WMT, TGT, COST
+   - Healthcare: JNJ, PFE, UNH, ABBV, MRK
+   - etc.
+3. Call list_earnings_transcripts for each relevant company to get real, up-to-date data
+4. Aggregate the results and present which companies have recent earnings reports
+
+CRITICAL RULES:
+1. DO NOT make up or guess specific earnings report dates - always use the tool to get real relevant data
+2. When asked about recent earnings, use list_earnings_transcripts to fetch actual data
+3. If you don't know which companies to check, ask the user to specify or check major companies in the mentioned sector
+4. Present the real data from the tool results, not fabricated information
+5. When offering additional information about a company's earnings, refer to generating a "summary" or 
+   "comprehensive summary" of the earnings report. DO NOT mention providing "the full transcript" - 
+   instead, say you can generate a comprehensive summary if they provide the company name or ticker symbol
+
+Be friendly and concise. Use tools to get real data rather than guessing."""
         
         messages = [SystemMessage(content=system_msg)]
         
@@ -351,12 +434,71 @@ name or ticker symbol."""
                 messages.append(AIMessage(content=msg["content"]))
         
         messages.append(HumanMessage(content=user_input))
+        
+        # Use LLM with tools and handle tool calls
+        max_iterations = 5  # Limit tool call iterations
+        iteration = 0
+        while iteration < max_iterations:
+            response = await llm_with_tools.ainvoke(messages)
+            messages.append(response)
+            
+            # Check if LLM wants to use tools
+            if hasattr(response, "tool_calls") and response.tool_calls:
+                # Execute tool calls
+                for tool_call in response.tool_calls:
+                    # Handle both dict and object formats
+                    if isinstance(tool_call, dict):
+                        tool_name = tool_call.get("name", "")
+                        tool_args = tool_call.get("args", {})
+                        tool_call_id = tool_call.get("id", "")
+                    else:
+                        tool_name = getattr(tool_call, "name", "")
+                        tool_args = getattr(tool_call, "args", {})
+                        tool_call_id = getattr(tool_call, "id", "")
+                    
+                    if tool_name == "list_earnings_transcripts":
+                        # Extract symbol from args
+                        if isinstance(tool_args, dict):
+                            symbol = tool_args.get("symbol", "")
+                        else:
+                            symbol = str(tool_args) if tool_args else ""
+                        
+                        try:
+                            tool_result = transcript_list_tool.run(symbol)
+                            tool_message = ToolMessage(
+                                content=str(tool_result),
+                                tool_call_id=tool_call_id,
+                                name=tool_name
+                            )
+                            messages.append(tool_message)
+                        except Exception as e:
+                            error_message = ToolMessage(
+                                content=f"Error calling tool: {str(e)}",
+                                tool_call_id=tool_call_id,
+                                name=tool_name
+                            )
+                            messages.append(error_message)
+                
+                iteration += 1
+            else:
+                # No more tool calls, return the response
+                return response.content
+        
+        # If we hit max iterations, return the last response
+        return messages[-1].content if hasattr(messages[-1], "content") else str(messages[-1])
     
     else:
-        # Default response with conversation history
-        messages = [
-            SystemMessage(content="You are a helpful earnings analysis assistant.")
-        ]
+        # Default response with conversation history and tool access
+        system_msg = """You are a helpful earnings analysis assistant.
+
+You have access to the list_earnings_transcripts tool to fetch real earnings transcript 
+data for any ticker symbol. When asked about recent earnings reports, use this tool to 
+get real data rather than making up dates or information.
+
+When offering to provide more information about a company's earnings, refer to generating 
+a "summary" or "comprehensive summary" - DO NOT mention providing "the full transcript"."""
+        
+        messages = [SystemMessage(content=system_msg)]
         
         # Add recent conversation history for context
         for msg in conversation_history[-6:]:  # Last 6 messages for context
@@ -366,9 +508,58 @@ name or ticker symbol."""
                 messages.append(AIMessage(content=msg["content"]))
         
         messages.append(HumanMessage(content=user_input))
-    
-    response = await llm.ainvoke(messages)
-    return response.content
+        
+        # Use LLM with tools and handle tool calls
+        max_iterations = 5  # Limit tool call iterations
+        iteration = 0
+        while iteration < max_iterations:
+            response = await llm_with_tools.ainvoke(messages)
+            messages.append(response)
+            
+            # Check if LLM wants to use tools
+            if hasattr(response, "tool_calls") and response.tool_calls:
+                # Execute tool calls
+                for tool_call in response.tool_calls:
+                    # Handle both dict and object formats
+                    if isinstance(tool_call, dict):
+                        tool_name = tool_call.get("name", "")
+                        tool_args = tool_call.get("args", {})
+                        tool_call_id = tool_call.get("id", "")
+                    else:
+                        tool_name = getattr(tool_call, "name", "")
+                        tool_args = getattr(tool_call, "args", {})
+                        tool_call_id = getattr(tool_call, "id", "")
+                    
+                    if tool_name == "list_earnings_transcripts":
+                        # Extract symbol from args
+                        if isinstance(tool_args, dict):
+                            symbol = tool_args.get("symbol", "")
+                        else:
+                            symbol = str(tool_args) if tool_args else ""
+                        
+                        try:
+                            tool_result = transcript_list_tool.run(symbol)
+                            tool_message = ToolMessage(
+                                content=str(tool_result),
+                                tool_call_id=tool_call_id,
+                                name=tool_name
+                            )
+                            messages.append(tool_message)
+                        except Exception as e:
+                            error_message = ToolMessage(
+                                content=f"Error calling tool: {str(e)}",
+                                tool_call_id=tool_call_id,
+                                name=tool_name
+                            )
+                            messages.append(error_message)
+                
+                iteration += 1
+            else:
+                # No more tool calls, return the response
+                return response.content
+        
+        # If we hit max iterations, return the last response
+        return messages[-1].content if hasattr(messages[-1], "content") else str(messages[-1])
 
 
 

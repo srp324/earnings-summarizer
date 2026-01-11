@@ -1191,6 +1191,11 @@ async def run_earnings_analysis(company_query: str) -> Dict[str, Any]:
         "messages": processed_messages,
         "stage": result.get("current_stage"),
         "error": result.get("error"),
+        "ticker_symbol": result.get("ticker_symbol"),
+        "company_name": result.get("company_name"),
+        "requested_fiscal_year": result.get("requested_fiscal_year"),
+        "requested_quarter": result.get("requested_quarter"),
+        "company_query": company_query,  # Also include original query for reference
     }
 
 
