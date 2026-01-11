@@ -191,8 +191,8 @@ Your task is to:
 2. You MAY use list_earnings_transcripts to verify the transcript is available, but this is optional
 3. The transcript_retriever will handle fetching the specific transcript
 
-IMPORTANT: Before calling any tools, briefly explain your reasoning. For example:
-- "The user provided {requested_fiscal_year} Q{requested_quarter}, so I should verify the transcript is available for this specific period"
+IMPORTANT: Before calling any tools, briefly explain your reasoning in simple terms without mentioning the tool itself. For example:
+- "The user provided {requested_fiscal_year} Q{requested_quarter}, so I'll verify the transcript is available for this specific period"
 - "The user query mentions [company], which corresponds to ticker [TICKER]"
 
 Common ticker symbols:
@@ -225,12 +225,13 @@ Your task is to:
 2. DO NOT use list_earnings_transcripts - skip it entirely
 3. The transcript_retriever will automatically fetch the MOST RECENT transcript
 
-IMPORTANT: Before proceeding, briefly explain your reasoning. For example:
-- "The user did not specify a fiscal quarter, so I'll let the transcript_retriever fetch the most recent transcript automatically"
-- "The user query mentions [company], which corresponds to ticker [TICKER]. Since no quarter was specified, I'll proceed to the next step"
+IMPORTANT: Before proceeding, briefly explain your reasoning in simple terms without mention of the tools called. For example:
+- "The user did not specify a fiscal quarter, so I'll fetch the most recent transcript"
+- "The user query mentions [company], which corresponds to ticker [TICKER]. Since no quarter was specified, I'll proceed to get the latest transcript"
 
 CRITICAL: Since no year/quarter was specified, DO NOT call list_earnings_transcripts. 
 The transcript_retriever will handle getting the latest transcript automatically.
+Proceed directly to the next step where the latest transcript will be retrieved.
 
 Common ticker symbols:
 - AAPL = Apple
@@ -356,7 +357,7 @@ DO NOT use list_earnings_transcripts - proceed directly to the next step.
                         logger.info(f"Embeddings already exist for {ticker_symbol} FY{requested_fiscal_year} Q{requested_quarter}, skipping transcript retrieval")
                         # Store metadata in state for use in summarizer
                         # Add a message to make the stage visible - keep it as "retrieving_transcript" stage so "Retrieving Reports" is shown
-                        message = AIMessage(content=f"Found existing embeddings for {ticker_symbol} FY{requested_fiscal_year} Q{requested_quarter}. Using cached transcript data for analysis.")
+                        message = AIMessage(content=f"Transcript for {ticker_symbol} {requested_fiscal_year}Q{requested_quarter} has been fetched. Preparing for analysis...")
                         return {
                             "messages": [message],
                             "current_stage": "retrieving_transcript",  # Use retrieving_transcript so "Retrieving Reports" is shown
@@ -369,7 +370,7 @@ DO NOT use list_earnings_transcripts - proceed directly to the next step.
                     else:
                         logger.info(f"Embeddings do not exist for {ticker_symbol} FY{requested_fiscal_year} Q{requested_quarter}, will retrieve transcript")
                         # Add a message to make the stage visible
-                        message = AIMessage(content=f"No existing embeddings found for {ticker_symbol} FY{requested_fiscal_year} Q{requested_quarter}. Retrieving transcript from website.")
+                        message = AIMessage(content=f"Fetching transcript for {ticker_symbol} {requested_fiscal_year}Q{requested_quarter}...")
                         return {
                             "messages": [message],
                             "current_stage": "retrieving_transcript",
@@ -396,7 +397,14 @@ DO NOT use list_earnings_transcripts - proceed directly to the next step.
                 # OR when transcript was already retrieved via tools
                 if transcript_already_retrieved:
                     logger.info(f"Transcript already retrieved via tools, routing to store_embeddings")
-                    message = AIMessage(content="Transcript retrieved. Preparing for analysis...")
+                    # Build user-friendly message with ticker/year/quarter if available
+                    if ticker_symbol and requested_fiscal_year and requested_quarter:
+                        message_content = f"Transcript for {ticker_symbol} {requested_fiscal_year}Q{requested_quarter} has been fetched. Preparing for analysis..."
+                    elif ticker_symbol:
+                        message_content = f"Latest earnings report transcript for {ticker_symbol} has been fetched. Preparing for analysis..."
+                    else:
+                        message_content = "Latest earnings report transcript has been retrieved. Preparing for analysis..."
+                    message = AIMessage(content=message_content)
                     return {
                         "messages": [message],
                         "current_stage": "retrieving_transcript",  # Keep as retrieving_transcript to show "Retrieving Reports"
