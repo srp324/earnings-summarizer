@@ -1439,10 +1439,14 @@ async def stream_earnings_analysis(company_query: str):
                 "summary": summary,
                 "messages": node_output.get("messages", []),
                 "reasoning": reasoning,  # Add reasoning to update
+                "ticker_symbol": current_state.get("ticker_symbol"),  # Include ticker symbol from state
+                "company_name": current_state.get("company_name"),  # Include company name from state
+                "requested_fiscal_year": current_state.get("requested_fiscal_year"),
+                "requested_quarter": current_state.get("requested_quarter"),
             }
             
             # Always yield update for all nodes (tools node is filtered out in routes.py)
             # This ensures we capture transcript_retriever even if reasoning extraction fails
-            logger.info(f"Yielding update for {node_name}: stage={update['stage']}, current_stage={current_stage}, has_reasoning={bool(reasoning)}")
+            logger.info(f"Yielding update for {node_name}: stage={update['stage']}, current_stage={current_stage}, has_reasoning={bool(reasoning)}, ticker_symbol={update.get('ticker_symbol')}")
             yield update
 

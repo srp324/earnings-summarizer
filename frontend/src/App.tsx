@@ -2,6 +2,7 @@ import { useState, useRef, useEffect } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { Send, TrendingUp, Loader2, Sparkles, BarChart3, Search, CheckCircle, AlertCircle, ChevronDown, ChevronUp } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
+import { MetricsDashboard } from './components/MetricsDashboard'
 
 interface Message {
   id: string
@@ -9,6 +10,8 @@ interface Message {
   content: string
   timestamp: Date
   stages?: AnalysisStage[] // Optional stage flow data for analysis messages
+  tickerSymbol?: string // Ticker symbol for financial dashboard
+  companyName?: string // Company name for financial dashboard
 }
 
 interface AnalysisStage {
@@ -111,6 +114,9 @@ function App() {
         let assistantContent = ''
         let receivedSessionId = sessionId
         let actionTaken = 'chat'
+        // Hold pending metrics dashboard info so we can render it AFTER the summary
+        let pendingMetricsTicker: string | undefined
+        let pendingMetricsCompany: string | undefined
 
         while (true) {
           const { done, value } = await reader.read()
@@ -255,6 +261,10 @@ function App() {
                     stagesRef.current = completedStages
                     setIsAnalyzing(false)
                   }
+                } else if (data.type === 'metrics_dashboard') {
+                  // Remember metrics dashboard data; we'll render it after the summary message
+                  pendingMetricsTicker = data.ticker_symbol
+                  pendingMetricsCompany = data.company_name
                 } else if (data.type === 'error') {
                   // Error occurred
                   assistantContent = data.message || data.error || 'An error occurred'
@@ -283,15 +293,30 @@ function App() {
           setSessionId(receivedSessionId)
         }
 
-        // Add assistant message
+        // Add assistant message (summary)
         if (assistantContent) {
-          const assistantMessage: Message = {
+          const summaryMessage: Message = {
             id: (Date.now() + 1).toString(),
             role: 'assistant',
             content: assistantContent,
             timestamp: new Date(),
           }
-          setMessages(prev => [...prev, assistantMessage])
+          
+          setMessages(prev => {
+            const updated = [...prev, summaryMessage]
+            // Immediately follow summary with metrics dashboard, if available
+            if (pendingMetricsTicker) {
+              updated.push({
+                id: `metrics-${Date.now() + 2}`,
+                role: 'assistant',
+                content: '',
+                timestamp: new Date(),
+                tickerSymbol: pendingMetricsTicker,
+                companyName: pendingMetricsCompany,
+              })
+            }
+            return updated
+          })
         }
       } else {
         // Fallback to non-streaming endpoint
@@ -437,6 +462,9 @@ function App() {
                         message.role === 'user'
                           ? 'bg-gradient-to-br from-ocean-600 to-ocean-700 text-white'
                           : 'bg-slate-800/80 text-slate-100'
+                      } ${
+                        // Make metrics dashboard messages expand to full available width
+                        message.role === 'assistant' && message.tickerSymbol ? 'w-full' : ''
                       }`}
                     >
                       {message.role === 'assistant' && hasStageFlow ? (
@@ -528,8 +556,19 @@ function App() {
                           })}
                         </div>
                       ) : message.role === 'assistant' ? (
-                        <div className="markdown-content">
-                          <ReactMarkdown>{message.content}</ReactMarkdown>
+                        <div className="w-full">
+                          {message.content ? (
+                            <div className="markdown-content">
+                              <ReactMarkdown>{message.content}</ReactMarkdown>
+                            </div>
+                          ) : null}
+                          {message.tickerSymbol && (
+                            <div className="mt-4 w-full">
+                              <MetricsDashboard 
+                                tickerSymbol={message.tickerSymbol}
+                              />
+                            </div>
+                          )}
                         </div>
                       ) : (
                         <p className="text-lg">{message.content}</p>

@@ -9,7 +9,7 @@ import json
 import asyncio
 import logging
 from datetime import datetime
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Optional
 
 from app.schemas import (
     EarningsRequest, 
@@ -26,7 +26,35 @@ from app.database import get_db, SearchSession
 from app.agents.earnings_agent import run_earnings_analysis, stream_earnings_analysis
 from app.agents.conversation_router import ConversationRouter, create_chat_response
 from app.session_manager import get_session_manager
+from app.services.financial_scraper import scrape_company_financials
+from app.services.metrics_service import store_scraped_metrics, get_metrics, get_metrics_history
 from langchain_core.messages import AIMessage
+import asyncio
+
+
+async def scrape_and_store_metrics(
+    ticker_symbol: str,
+    company_name: str,
+    session_id: str
+):
+    """Helper function to scrape and store metrics in background."""
+    try:
+        logger.info(f"Starting background scrape for {ticker_symbol}")
+        # Create a new database session for the background task
+        from app.database import AsyncSessionLocal
+        async with AsyncSessionLocal() as db:
+            scraped_data = await scrape_company_financials(ticker_symbol.upper())
+            if scraped_data and any(scraped_data.values()):
+                await store_scraped_metrics(
+                    db=db,
+                    ticker_symbol=ticker_symbol.upper(),
+                    company_name=company_name,
+                    scraped_data=scraped_data,
+                    session_id=session_id
+                )
+                logger.info(f"Successfully scraped and stored metrics for {ticker_symbol}")
+    except Exception as e:
+        logger.error(f"Error in background metrics scrape for {ticker_symbol}: {e}", exc_info=True)
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -301,6 +329,9 @@ async def chat_stream(
                 last_mapped_stage = None  # Track the last mapped stage (with id and label)
                 current_active_stage_id = None  # Track the currently active stage ID
                 async for update in stream_earnings_analysis(company_query):
+                    # Preserve ticker_symbol from any update that has it
+                    if update.get("ticker_symbol") and not final_result:
+                        final_result = {}
                     stage = update.get("stage", "processing")
                     node = update.get("node", "")
                     reasoning = update.get("reasoning")  # Extract reasoning from update
@@ -379,7 +410,11 @@ async def chat_stream(
                     
                     # Track final result (keep updating as we get more complete data)
                     if update.get("has_summary") or update.get("summary"):
-                        final_result = update
+                        # Merge updates to preserve all fields including ticker_symbol
+                        if final_result:
+                            final_result.update(update)
+                        else:
+                            final_result = update.copy()
                         # Don't mark as complete here - wait until stream is finished
                         # The stage will be marked complete when we actually move to a different stage
                         # or when the analysis is fully complete (handled after the stream loop)
@@ -390,6 +425,10 @@ async def chat_stream(
                         "summary": final_result.get("summary"),
                         "messages": final_result.get("messages", []),
                         "error": None,
+                        "ticker_symbol": final_result.get("ticker_symbol"),
+                        "company_name": final_result.get("company_name"),
+                        "requested_fiscal_year": final_result.get("requested_fiscal_year"),
+                        "requested_quarter": final_result.get("requested_quarter"),
                     }
                 else:
                     # Fallback: run full analysis if stream didn't provide complete result
@@ -451,16 +490,47 @@ async def chat_stream(
                     }
                     yield f"data: {json.dumps(complete_update_data)}\n\n"
                 
-                # Send final result
+                # Send final result with ticker symbol and company name
                 complete_data = {
                     'type': 'complete',
                     'session_id': session.session_id,
                     'message': summary,
                     'action_taken': 'analysis_triggered',
                     'intent': classification.intent,
+                    'ticker_symbol': result.get('ticker_symbol'),
+                    'company_name': result.get('company_name'),
                     'is_complete': True
                 }
                 yield f"data: {json.dumps(complete_data)}\n\n"
+                
+                # Automatically trigger scraping if we have a ticker symbol
+                ticker_symbol = result.get('ticker_symbol')
+                if ticker_symbol:
+                    logger.info(f"Ticker symbol found: {ticker_symbol}, sending metrics dashboard message")
+                    try:
+                        # Trigger scraping in background (don't wait for it)
+                        asyncio.create_task(
+                            scrape_and_store_metrics(
+                                ticker_symbol=ticker_symbol,
+                                company_name=result.get('company_name') or ticker_symbol,
+                                session_id=session.session_id
+                            )
+                        )
+                        
+                        # Send a separate message for the metrics dashboard
+                        metrics_message = {
+                            'type': 'metrics_dashboard',
+                            'session_id': session.session_id,
+                            'ticker_symbol': ticker_symbol,
+                            'company_name': result.get('company_name') or ticker_symbol,
+                            'is_complete': True
+                        }
+                        logger.info(f"Sending metrics_dashboard message for {ticker_symbol}")
+                        yield f"data: {json.dumps(metrics_message)}\n\n"
+                    except Exception as e:
+                        logger.error(f"Error triggering metrics scrape: {e}", exc_info=True)
+                else:
+                    logger.warning(f"No ticker symbol found in result. Result keys: {result.keys() if result else 'None'}")
             
             else:  # action == "chat"
                 # Generate chat response
@@ -673,4 +743,158 @@ async def chat(
         session.add_message("assistant", error_message)
         
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/metrics/{ticker_symbol}/scrape")
+async def scrape_financial_metrics(
+    ticker_symbol: str,
+    company_name: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Scrape financial metrics from discountingcashflows.com for a ticker symbol.
+    
+    This endpoint:
+    1. Scrapes income statement, balance sheet, and cash flow statements
+    2. Stores the metrics in the database
+    3. Returns the scraped data
+    """
+    try:
+        # Scrape financial data
+        scraped_data = await scrape_company_financials(ticker_symbol.upper())
+        
+        # Store in database
+        if scraped_data and any(scraped_data.values()):
+            stored_metrics = await store_scraped_metrics(
+                db=db,
+                ticker_symbol=ticker_symbol.upper(),
+                company_name=company_name or ticker_symbol.upper(),
+                scraped_data=scraped_data
+            )
+            
+            return {
+                "ticker_symbol": ticker_symbol.upper(),
+                "company_name": company_name or ticker_symbol.upper(),
+                "periods_scraped": len(stored_metrics),
+                "metrics": [
+                    {
+                        "fiscal_year": m.fiscal_year,
+                        "fiscal_quarter": m.fiscal_quarter,
+                        "period": f"FY{m.fiscal_year} Q{m.fiscal_quarter}",
+                        "revenue": m.revenue,
+                        "net_income": m.net_income,
+                        "eps": m.eps,
+                    }
+                    for m in stored_metrics
+                ]
+            }
+        else:
+            raise HTTPException(
+                status_code=404, 
+                detail=f"No financial data found for ticker {ticker_symbol}"
+            )
+            
+    except Exception as e:
+        logger.error(f"Error scraping metrics for {ticker_symbol}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/metrics/{ticker_symbol}")
+async def get_company_metrics(
+    ticker_symbol: str,
+    fiscal_year: Optional[str] = None,
+    fiscal_quarter: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """Get financial metrics for a company."""
+    metrics = await get_metrics(db, ticker_symbol.upper(), fiscal_year, fiscal_quarter)
+    
+    if not metrics:
+        raise HTTPException(status_code=404, detail="Metrics not found")
+    
+    # Parse segment_data JSON if present
+    segment_data = None
+    if metrics.segment_data:
+        try:
+            segment_data = json.loads(metrics.segment_data)
+        except:
+            pass
+    
+    return {
+        "ticker_symbol": metrics.ticker_symbol,
+        "company_name": metrics.company_name,
+        "fiscal_year": metrics.fiscal_year,
+        "fiscal_quarter": metrics.fiscal_quarter,
+        "period": f"FY{metrics.fiscal_year} Q{metrics.fiscal_quarter}",
+        "revenue": metrics.revenue,
+        "revenue_qoq_change": metrics.revenue_qoq_change,
+        "revenue_yoy_change": metrics.revenue_yoy_change,
+        "eps": metrics.eps,
+        "eps_actual": metrics.eps_actual,
+        "eps_estimate": metrics.eps_estimate,
+        "eps_beat_miss": metrics.eps_beat_miss,
+        "net_income": metrics.net_income,
+        "gross_margin": metrics.gross_margin,
+        "operating_margin": metrics.operating_margin,
+        "net_margin": metrics.net_margin,
+        "free_cash_flow": metrics.free_cash_flow,
+        "operating_cash_flow": metrics.operating_cash_flow,
+        "total_assets": metrics.total_assets,
+        "total_liabilities": metrics.total_liabilities,
+        "total_equity": metrics.total_equity,
+        "current_assets": metrics.current_assets,
+        "current_liabilities": metrics.current_liabilities,
+        "revenue_guidance": metrics.revenue_guidance,
+        "eps_guidance": metrics.eps_guidance,
+        "segment_data": segment_data,
+        "report_date": metrics.report_date.isoformat() if metrics.report_date else None,
+    }
+
+
+@router.get("/metrics/{ticker_symbol}/history")
+async def get_metrics_history_endpoint(
+    ticker_symbol: str,
+    limit: int = 8,
+    db: AsyncSession = Depends(get_db),
+):
+    """Get historical financial metrics for a company."""
+    try:
+        history = await get_metrics_history(db, ticker_symbol.upper(), limit)
+    except Exception as e:
+        logger.error(f"Error fetching metrics history for {ticker_symbol}: {e}", exc_info=True)
+        # Return empty history instead of crashing
+        return {"ticker_symbol": ticker_symbol.upper(), "history": []}
+    
+    results = []
+    for metrics in history:
+        segment_data = None
+        if metrics.segment_data:
+            try:
+                segment_data = json.loads(metrics.segment_data)
+            except:
+                pass
+        
+        results.append({
+            "fiscal_year": metrics.fiscal_year,
+            "fiscal_quarter": metrics.fiscal_quarter,
+            "period": f"FY{metrics.fiscal_year} Q{metrics.fiscal_quarter}",
+            "revenue": metrics.revenue,
+            "revenue_qoq_change": metrics.revenue_qoq_change,
+            "revenue_yoy_change": metrics.revenue_yoy_change,
+            "eps": metrics.eps,
+            "eps_actual": metrics.eps_actual,
+            "eps_estimate": metrics.eps_estimate,
+            "net_income": metrics.net_income,
+            "gross_margin": metrics.gross_margin,
+            "operating_margin": metrics.operating_margin,
+            "net_margin": metrics.net_margin,
+            "free_cash_flow": metrics.free_cash_flow,
+            "operating_cash_flow": metrics.operating_cash_flow,
+            "total_assets": metrics.total_assets,
+            "total_liabilities": metrics.total_liabilities,
+            "total_equity": metrics.total_equity,
+            "report_date": metrics.report_date.isoformat() if metrics.report_date else None,
+        })
+    
+    return {"ticker_symbol": ticker_symbol.upper(), "history": results}
 
