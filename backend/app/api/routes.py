@@ -439,6 +439,16 @@ async def chat_stream(
                 db_session.summary = result.get("summary")
                 await db.commit()
                 
+                # Preserve previous ticker_symbol for scraping (before overwriting with new analysis)
+                # Use previous ticker_symbol if it exists, as it's more reliable than extracting from new query
+                previous_ticker_symbol = None
+                previous_company_name = None
+                if session.last_analysis:
+                    previous_ticker_symbol = session.last_analysis.get('ticker_symbol')
+                    previous_company_name = session.last_analysis.get('company_name')
+                    if previous_ticker_symbol:
+                        logger.info(f"Found previous ticker_symbol '{previous_ticker_symbol}' from last_analysis - will use for scraping if current result doesn't have one")
+                
                 # Store analysis in session
                 analysis_data = {
                     "company_query": company_query,
@@ -504,27 +514,116 @@ async def chat_stream(
                 yield f"data: {json.dumps(complete_data)}\n\n"
                 
                 # Automatically trigger scraping if we have a ticker symbol
-                ticker_symbol = result.get('ticker_symbol')
-                if ticker_symbol:
-                    logger.info(f"Ticker symbol found: {ticker_symbol}, sending metrics dashboard message")
+                # For NEW analyses (action == "analyze"), prioritize current result's ticker_symbol
+                # Also try to extract ticker from transcript source URL (most reliable - comes from transcript tool)
+                # Only use previous ticker_symbol if current result doesn't have one
+                # This ensures new analyses for different companies use the correct ticker
+                ticker_symbol_for_scraping = None
+                company_name_for_storage = None
+                
+                # Try to extract ticker from transcript source URL first (most reliable - from transcript tool)
+                # The transcript tool successfully retrieved the transcript using the correct ticker in the URL
+                # Format: https://discountingcashflows.com/company/{TICKER}/transcripts/{year}/{quarter}/
+                # Also check: _Source URL: https://discountingcashflows.com/company/SQ/transcripts/2025/2/_
+                ticker_from_url = None
+                import re
+                
+                # Check messages in result
+                messages_to_check = result.get('messages', [])
+                if messages_to_check:
+                    logger.info(f"Checking {len(messages_to_check)} messages for transcript source URL...")
+                    for idx, msg in enumerate(messages_to_check):
+                        content = None
+                        if isinstance(msg, dict):
+                            content = msg.get('content', '')
+                        elif hasattr(msg, 'content'):
+                            content = str(msg.content)
+                        
+                        if content and len(content) > 100:  # Only check substantial content
+                            # Look for source URL in transcript content - try multiple patterns
+                            patterns = [
+                                r'_Source URL: https?://[^/\s]+/company/([A-Z]+)/',  # Standard format
+                                r'/company/([A-Z]+)/transcripts/',  # URL pattern anywhere in content
+                                r'company/([A-Z]+)/transcripts/\d{4}/\d',  # More specific pattern
+                            ]
+                            
+                            for pattern in patterns:
+                                url_match = re.search(pattern, content)
+                                if url_match:
+                                    ticker_from_url = url_match.group(1).upper()
+                                    logger.info(f"Extracted ticker_symbol '{ticker_from_url}' from transcript source URL using pattern '{pattern}' (message {idx})")
+                                    break
+                            
+                            if ticker_from_url:
+                                break
+                
+                # Also check final_result if it has messages (from stream updates)
+                if not ticker_from_url and final_result and final_result.get('messages'):
+                    logger.info(f"Checking {len(final_result.get('messages', []))} messages from final_result for transcript source URL...")
+                    for idx, msg in enumerate(final_result.get('messages', [])):
+                        content = None
+                        if isinstance(msg, dict):
+                            content = msg.get('content', '')
+                        elif hasattr(msg, 'content'):
+                            content = str(msg.content)
+                        
+                        if content and len(content) > 100:
+                            patterns = [
+                                r'_Source URL: https?://[^/\s]+/company/([A-Z]+)/',
+                                r'/company/([A-Z]+)/transcripts/',
+                                r'company/([A-Z]+)/transcripts/\d{4}/\d',
+                            ]
+                            
+                            for pattern in patterns:
+                                url_match = re.search(pattern, content)
+                                if url_match:
+                                    ticker_from_url = url_match.group(1).upper()
+                                    logger.info(f"Extracted ticker_symbol '{ticker_from_url}' from transcript source URL using pattern '{pattern}' (final_result message {idx})")
+                                    break
+                            
+                            if ticker_from_url:
+                                break
+                
+                # Prioritize ticker from transcript URL (most reliable - from transcript tool)
+                # Then use current result's ticker_symbol (from the NEW analysis)
+                # This ensures that if user analyzes "Chubb" after "TSLA", we use "CB" not "TSLA" or "CHUBB"
+                if ticker_from_url:
+                    ticker_symbol_for_scraping = ticker_from_url
+                    company_name_for_storage = result.get('company_name') or ticker_from_url
+                    logger.info(f"Using ticker_symbol '{ticker_symbol_for_scraping}' from transcript source URL for scraping (most reliable)")
+                elif result.get('ticker_symbol'):
+                    ticker_symbol_for_scraping = result.get('ticker_symbol')
+                    company_name_for_storage = result.get('company_name') or result.get('ticker_symbol')
+                    logger.info(f"Using ticker_symbol '{ticker_symbol_for_scraping}' from current analysis result for scraping")
+                # Fallback to previous ticker_symbol only if current result doesn't have one
+                # This handles cases where current analysis didn't extract a ticker but previous one did
+                elif previous_ticker_symbol:
+                    ticker_symbol_for_scraping = previous_ticker_symbol
+                    company_name_for_storage = previous_company_name or previous_ticker_symbol
+                    logger.info(f"Using ticker_symbol '{ticker_symbol_for_scraping}' from previous analysis for scraping (current result has no ticker_symbol)")
+                
+                if ticker_symbol_for_scraping:
+                    logger.info(f"Ticker symbol found: {ticker_symbol_for_scraping}, sending metrics dashboard message")
                     try:
                         # Send loading message first, before starting the scrape
                         loading_message = {
                             'type': 'metrics_dashboard_loading',
                             'session_id': session.session_id,
-                            'ticker_symbol': ticker_symbol,
-                            'company_name': result.get('company_name') or ticker_symbol,
+                            'ticker_symbol': ticker_symbol_for_scraping,
+                            'company_name': company_name_for_storage or ticker_symbol_for_scraping,
                             'message': 'Loading financial metric charts...',
                             'is_complete': False
                         }
-                        logger.info(f"Sending metrics_dashboard_loading message for {ticker_symbol}")
+                        logger.info(f"Sending metrics_dashboard_loading message for {ticker_symbol_for_scraping}")
                         yield f"data: {json.dumps(loading_message)}\n\n"
                         
                         # Trigger scraping in background (don't wait for it)
+                        # ticker_symbol is what's used for scraping (URL construction)
+                        # company_name is just for database storage/display
                         asyncio.create_task(
                             scrape_and_store_metrics(
-                                ticker_symbol=ticker_symbol,
-                                company_name=result.get('company_name') or ticker_symbol,
+                                ticker_symbol=ticker_symbol_for_scraping,
+                                company_name=company_name_for_storage or ticker_symbol_for_scraping,
                                 session_id=session.session_id
                             )
                         )
@@ -533,16 +632,16 @@ async def chat_stream(
                         metrics_message = {
                             'type': 'metrics_dashboard',
                             'session_id': session.session_id,
-                            'ticker_symbol': ticker_symbol,
-                            'company_name': result.get('company_name') or ticker_symbol,
+                            'ticker_symbol': ticker_symbol_for_scraping,
+                            'company_name': company_name_for_storage or ticker_symbol_for_scraping,
                             'is_complete': True
                         }
-                        logger.info(f"Sending metrics_dashboard message for {ticker_symbol}")
+                        logger.info(f"Sending metrics_dashboard message for {ticker_symbol_for_scraping}")
                         yield f"data: {json.dumps(metrics_message)}\n\n"
                     except Exception as e:
                         logger.error(f"Error triggering metrics scrape: {e}", exc_info=True)
                 else:
-                    logger.warning(f"No ticker symbol found in result. Result keys: {result.keys() if result else 'None'}")
+                    logger.warning(f"No ticker symbol found in previous analysis or current result. Previous analysis: {session.last_analysis.get('ticker_symbol') if session.last_analysis else 'None'}, Current result keys: {result.keys() if result else 'None'}")
             
             else:  # action == "chat"
                 # Generate chat response
@@ -669,6 +768,16 @@ async def chat(
             db_session.status = "complete" if result.get("summary") else "error"
             db_session.summary = result.get("summary")
             await db.commit()
+            
+            # Preserve previous ticker_symbol for scraping (before overwriting with new analysis)
+            # Use previous ticker_symbol if it exists, as it's more reliable than extracting from new query
+            previous_ticker_symbol = None
+            previous_company_name = None
+            if session.last_analysis:
+                previous_ticker_symbol = session.last_analysis.get('ticker_symbol')
+                previous_company_name = session.last_analysis.get('company_name')
+                if previous_ticker_symbol:
+                    logger.info(f"Found previous ticker_symbol '{previous_ticker_symbol}' from last_analysis - will use for scraping if current result doesn't have one")
             
             # Store analysis in session
             analysis_data = {

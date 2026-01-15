@@ -335,7 +335,7 @@ export function MetricsDashboard({ tickerSymbol, currentMetrics }: MetricsDashbo
   return (
     <div className="w-full space-y-6">
       <div className="border-t border-slate-700/50 pt-4 mt-4">
-        <h3 className="text-lg font-semibold text-white mb-4">Financial Metrics Dashboard</h3>
+        <h3 className="text-lg font-semibold text-white mb-4">Financial Metrics Charts</h3>
         
         {/* Show message if we have history records but no chartable data */}
         {!hasChartData && history.history.length > 0 && (
