@@ -12,6 +12,7 @@ interface Message {
   stages?: AnalysisStage[] // Optional stage flow data for analysis messages
   tickerSymbol?: string // Ticker symbol for financial dashboard
   companyName?: string // Company name for financial dashboard
+  isMetricsLoading?: boolean // Flag to show loading state for metrics dashboard
 }
 
 interface AnalysisStage {
@@ -117,6 +118,7 @@ function App() {
         // Hold pending metrics dashboard info so we can render it AFTER the summary
         let pendingMetricsTicker: string | undefined
         let pendingMetricsCompany: string | undefined
+        let metricsLoadingMessageId: string | undefined
 
         while (true) {
           const { done, value } = await reader.read()
@@ -261,10 +263,50 @@ function App() {
                     stagesRef.current = completedStages
                     setIsAnalyzing(false)
                   }
-                } else if (data.type === 'metrics_dashboard') {
-                  // Remember metrics dashboard data; we'll render it after the summary message
+                } else if (data.type === 'metrics_dashboard_loading') {
+                  // Store loading message info - we'll add it after the summary
+                  // DON'T overwrite assistantContent - that contains the summary!
+                  metricsLoadingMessageId = `metrics-loading-${Date.now()}`
                   pendingMetricsTicker = data.ticker_symbol
                   pendingMetricsCompany = data.company_name
+                  console.log('[App] Received metrics_dashboard_loading for', data.ticker_symbol, 'messageId:', metricsLoadingMessageId)
+                } else if (data.type === 'metrics_dashboard') {
+                  // Replace loading message with actual dashboard
+                  pendingMetricsTicker = data.ticker_symbol
+                  pendingMetricsCompany = data.company_name
+                  console.log('[App] Received metrics_dashboard for', data.ticker_symbol, 'looking for messageId:', metricsLoadingMessageId)
+                  
+                  // Only replace if loading message already exists in messages
+                  // Otherwise, wait for summary to be added first, then add dashboard after summary
+                  setMessages(prev => {
+                    if (metricsLoadingMessageId) {
+                      const loadingIndex = prev.findIndex(m => m.id === metricsLoadingMessageId)
+                      console.log('[App] Looking for loading message with id:', metricsLoadingMessageId, 'found at index:', loadingIndex)
+                      if (loadingIndex !== -1) {
+                        // Replace loading message with actual dashboard (clear isMetricsLoading flag)
+                        const updated = [...prev]
+                        updated[loadingIndex] = {
+                          id: metricsLoadingMessageId,
+                          role: 'assistant',
+                          content: '',
+                          timestamp: new Date(),
+                          tickerSymbol: pendingMetricsTicker,
+                          companyName: pendingMetricsCompany,
+                          // Don't set isMetricsLoading at all (undefined = false)
+                        }
+                        console.log('[App] ✅ Replaced loading message with dashboard message for', pendingMetricsTicker)
+                        return updated
+                      } else {
+                        // Loading message not added yet - don't add dashboard yet, wait for summary
+                        // The summary addition logic will handle adding the dashboard after summary
+                        console.log('[App] Loading message not found yet, will add dashboard after summary for', pendingMetricsTicker)
+                      }
+                    } else {
+                      // No loading message ID - don't add dashboard yet, wait for summary
+                      console.log('[App] No loading message ID, will add dashboard after summary for', pendingMetricsTicker)
+                    }
+                    return prev
+                  })
                 } else if (data.type === 'error') {
                   // Error occurred
                   assistantContent = data.message || data.error || 'An error occurred'
@@ -304,15 +346,74 @@ function App() {
           
           setMessages(prev => {
             const updated = [...prev, summaryMessage]
-            // Immediately follow summary with metrics dashboard, if available
-            if (pendingMetricsTicker) {
-              updated.push({
-                id: `metrics-${Date.now() + 2}`,
-                role: 'assistant',
-                content: '',
-                timestamp: new Date(),
-                tickerSymbol: pendingMetricsTicker,
-                companyName: pendingMetricsCompany,
+            // Add metrics dashboard after summary (only if we haven't already added it)
+            if (pendingMetricsTicker && !prev.some(m => m.tickerSymbol === pendingMetricsTicker && m.id !== summaryMessage.id)) {
+              // Check if metrics_dashboard event already came (which means data is ready)
+              // If a dashboard message already exists (without isMetricsLoading), skip adding loading message
+              const hasDashboardMessage = prev.some(m => m.tickerSymbol === pendingMetricsTicker && m.isMetricsLoading === undefined)
+              
+              console.log('[App] Adding metrics message after summary:', {
+                pendingMetricsTicker,
+                metricsLoadingMessageId,
+                hasDashboardMessage,
+                hasLoadingMessage: prev.some(m => m.id === metricsLoadingMessageId)
+              })
+              
+              if (!hasDashboardMessage) {
+                // Always add metrics message AFTER summary
+                // Use the loading message ID if it exists, otherwise create a new one
+                const messageId = metricsLoadingMessageId || `metrics-${Date.now() + 2}`
+                
+                // Check if metrics_dashboard event already came (by checking if we have pendingMetricsTicker but no loading message in array)
+                // If metrics_dashboard came, the loading message would have been replaced, so we add dashboard
+                // Otherwise, add loading message
+                const loadingMessageExists = prev.some(m => m.id === metricsLoadingMessageId && m.isMetricsLoading === true)
+                
+                if (!loadingMessageExists && metricsLoadingMessageId) {
+                  // Loading message doesn't exist - metrics_dashboard probably came, so add dashboard
+                  updated.push({
+                    id: messageId,
+                    role: 'assistant',
+                    content: '',
+                    timestamp: new Date(),
+                    tickerSymbol: pendingMetricsTicker,
+                    companyName: pendingMetricsCompany,
+                    // Don't set isMetricsLoading - this is the dashboard
+                  })
+                  console.log('[App] ✅ Added dashboard message after summary for', pendingMetricsTicker, '(metrics_dashboard already came)')
+                } else if (metricsLoadingMessageId && !prev.some(m => m.id === metricsLoadingMessageId)) {
+                  // Add loading message (metrics_dashboard hasn't come yet)
+                  updated.push({
+                    id: messageId,
+                    role: 'assistant',
+                    content: 'Loading financial metric charts...',
+                    timestamp: new Date(),
+                    tickerSymbol: pendingMetricsTicker,
+                    companyName: pendingMetricsCompany,
+                    isMetricsLoading: true
+                  })
+                  console.log('[App] ✅ Added loading message after summary for', pendingMetricsTicker)
+                } else if (!metricsLoadingMessageId) {
+                  // No loading message ID - add dashboard directly
+                  updated.push({
+                    id: messageId,
+                    role: 'assistant',
+                    content: '',
+                    timestamp: new Date(),
+                    tickerSymbol: pendingMetricsTicker,
+                    companyName: pendingMetricsCompany,
+                  })
+                  console.log('[App] ✅ Added dashboard message directly after summary for', pendingMetricsTicker)
+                } else {
+                  console.log('[App] ⚠️ Message already exists for', pendingMetricsTicker)
+                }
+              } else {
+                console.log('[App] ⚠️ Dashboard message already exists for', pendingMetricsTicker, 'skipping')
+              }
+            } else {
+              console.log('[App] ⚠️ Not adding metrics message:', {
+                hasPendingTicker: !!pendingMetricsTicker,
+                alreadyExists: prev.some(m => m.tickerSymbol === pendingMetricsTicker && m.id !== summaryMessage.id)
               })
             }
             return updated
@@ -564,9 +665,26 @@ function App() {
                           ) : null}
                           {message.tickerSymbol && (
                             <div className="mt-4 w-full">
-                              <MetricsDashboard 
-                                tickerSymbol={message.tickerSymbol}
-                              />
+                              {message.isMetricsLoading === true ? (
+                                <div className="text-center py-8">
+                                  <div className="text-slate-400 mb-2">
+                                    {message.content || 'Loading financial metric charts...'}
+                                  </div>
+                                  <div className="text-slate-500 text-sm mt-2">
+                                    This may take 30-60 seconds while we fetch data from financial statements
+                                  </div>
+                                  <div className="flex justify-center mt-4">
+                                    <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-ocean-400"></div>
+                                  </div>
+                                </div>
+                              ) : (
+                                <>
+                                  {console.log('[App] Rendering MetricsDashboard for', message.tickerSymbol, 'isMetricsLoading:', message.isMetricsLoading)}
+                                  <MetricsDashboard 
+                                    tickerSymbol={message.tickerSymbol}
+                                  />
+                                </>
+                              )}
                             </div>
                           )}
                         </div>

@@ -508,6 +508,18 @@ async def chat_stream(
                 if ticker_symbol:
                     logger.info(f"Ticker symbol found: {ticker_symbol}, sending metrics dashboard message")
                     try:
+                        # Send loading message first, before starting the scrape
+                        loading_message = {
+                            'type': 'metrics_dashboard_loading',
+                            'session_id': session.session_id,
+                            'ticker_symbol': ticker_symbol,
+                            'company_name': result.get('company_name') or ticker_symbol,
+                            'message': 'Loading financial metric charts...',
+                            'is_complete': False
+                        }
+                        logger.info(f"Sending metrics_dashboard_loading message for {ticker_symbol}")
+                        yield f"data: {json.dumps(loading_message)}\n\n"
+                        
                         # Trigger scraping in background (don't wait for it)
                         asyncio.create_task(
                             scrape_and_store_metrics(
@@ -517,7 +529,7 @@ async def chat_stream(
                             )
                         )
                         
-                        # Send a separate message for the metrics dashboard
+                        # Send a separate message for the metrics dashboard (after loading message)
                         metrics_message = {
                             'type': 'metrics_dashboard',
                             'session_id': session.session_id,
@@ -860,6 +872,14 @@ async def get_metrics_history_endpoint(
     """Get historical financial metrics for a company."""
     try:
         history = await get_metrics_history(db, ticker_symbol.upper(), limit)
+        logger.info(f"Fetched {len(history)} metrics records for {ticker_symbol}")
+        
+        # Log sample data for debugging
+        if history:
+            sample = history[0]
+            logger.debug(f"Sample metric for {ticker_symbol}: revenue={sample.revenue}, eps={sample.eps}, "
+                        f"gross_margin={sample.gross_margin}, operating_margin={sample.operating_margin}, "
+                        f"free_cash_flow={sample.free_cash_flow}, operating_cash_flow={sample.operating_cash_flow}")
     except Exception as e:
         logger.error(f"Error fetching metrics history for {ticker_symbol}: {e}", exc_info=True)
         # Return empty history instead of crashing

@@ -67,6 +67,8 @@ class FinancialMetrics(Base):
     company_name = Column(String(255), nullable=False)
     fiscal_year = Column(String(4), nullable=False, index=True)
     fiscal_quarter = Column(String(1), nullable=False, index=True)  # 1, 2, 3, 4
+    # Optional textual label like "FY2024 Q2" for compatibility with older schemas
+    fiscal_period = Column(String(50), nullable=True)
     report_date = Column(DateTime)  # When the earnings report was released
     
     # Revenue metrics
@@ -166,7 +168,14 @@ async def init_db():
             ADD COLUMN IF NOT EXISTS source_url text,
             ADD COLUMN IF NOT EXISTS session_id varchar(100),
             ADD COLUMN IF NOT EXISTS created_at timestamp,
-            ADD COLUMN IF NOT EXISTS updated_at timestamp
+            ADD COLUMN IF NOT EXISTS updated_at timestamp,
+            ADD COLUMN IF NOT EXISTS fiscal_period varchar(50)
+        """))
+
+        # Ensure fiscal_period is nullable so inserts don't fail on older databases
+        await conn.execute(text("""
+            ALTER TABLE IF EXISTS financial_metrics
+            ALTER COLUMN fiscal_period DROP NOT NULL
         """))
 
         await conn.run_sync(Base.metadata.create_all)

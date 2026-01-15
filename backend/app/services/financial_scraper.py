@@ -109,24 +109,87 @@ class FinancialScraper:
                     const tbody = table.querySelector('tbody');
                     const rows = [];
                     if (tbody) {
-                        const trElements = tbody.querySelectorAll('tr[id]');
-                        trElements.forEach(tr => {
-                            const metricId = tr.getAttribute('id');
+                        // Get all rows, but prioritize parent rows (main financial metrics)
+                        // Also include rows with row-description cells that aren't child rows
+                        const allRows = tbody.querySelectorAll('tr');
+                        const processedIds = new Set(); // Track processed metric IDs to avoid duplicates
+                        
+                        allRows.forEach(tr => {
+                            // Skip child rows (they have class starting with "child-row-")
+                            if (tr.classList.contains('child-row') || tr.className.includes('child-row-')) {
+                                return;
+                            }
+                            
+                            // Skip if this row is a child of another row
+                            if (tr.className && tr.className.includes('child-row')) {
+                                return;
+                            }
+                            // Find the row-description cell which contains the metric information
+                            const rowDescriptionCell = tr.querySelector('td.row-description');
+                            if (!rowDescriptionCell) return; // Skip if no row-description cell
+                            
+                            // Find the span with class "row-description-text" which contains the metric identifier
+                            const metricSpan = rowDescriptionCell.querySelector('span.row-description-text');
+                            
+                            let metricId = null;
+                            let metricName = null;
+                            
+                            if (metricSpan) {
+                                // Primary: Get the metric ID from the data-dev attribute (camelCase identifier)
+                                metricId = metricSpan.getAttribute('data-dev');
+                                
+                                // Get the metric name from the span's title attribute or text content
+                                metricName = metricSpan.getAttribute('title') || metricSpan.textContent.trim();
+                            }
+                            
+                            // Fallback: Use tr id attribute if data-dev is not available
+                            if (!metricId) {
+                                metricId = tr.getAttribute('id');
+                                // Remove "row-" prefix if present
+                                if (metricId && metricId.startsWith('row-')) {
+                                    metricId = metricId.substring(4);
+                                }
+                            }
+                            
+                            // Fallback: Try to get name from first cell text if span not found
+                            if (!metricName) {
+                                metricName = rowDescriptionCell.textContent.trim();
+                            }
+                            
+                            // If still no metric ID, try to derive from text content
+                            // This handles cases where rows don't have data-dev or id attributes
+                            if (!metricId && metricName) {
+                                // Create a slug-like ID from the name
+                                metricId = metricName.toLowerCase()
+                                    .replace(/[^a-z0-9]+/g, '-')
+                                    .replace(/^-|-$/g, '')
+                                    .replace(/\s+/g, '-');
+                            }
+                            
+                            // Skip if we still can't identify the metric
                             if (!metricId) return;
                             
-                            // Get all cells, skip first one (row header)
-                            const cells = tr.querySelectorAll('td');
+                            // Skip if this looks like a calculated/derived metric and we want main line items
+                            // But don't skip - we want all metrics for now
+                            
+                            // Get all formatted-value cells from this parent row
+                            // These contain the actual financial values for each period
+                            const formattedValueCells = tr.querySelectorAll('td.formatted-value');
                             const values = [];
                             
-                            // Start from index 1 to skip the first column (row header)
-                            for (let i = 1; i < cells.length; i++) {
-                                const cell = cells[i];
-                                const text = cell.textContent.trim();
+                            formattedValueCells.forEach(cell => {
+                                // Prefer data-value attribute for raw numeric value (more accurate)
+                                let text = cell.getAttribute('data-value');
+                                
+                                // Fallback to text content if data-value not available
+                                if (!text) {
+                                    text = cell.textContent.trim();
+                                }
                                 
                                 // Skip empty cells
                                 if (!text) {
                                     values.push(null);
-                                    continue;
+                                    return;
                                 }
                                 
                                 // Parse numeric values (remove commas, handle negative in parentheses)
@@ -138,17 +201,17 @@ class FinancialScraper:
                                 // Try to parse as float, otherwise keep as string
                                 const numValue = parseFloat(value);
                                 values.push(isNaN(numValue) ? (text || null) : numValue);
-                            }
-                            
-                            // Get the metric name from the first cell (row header)
-                            const firstCell = tr.querySelector('td:first-child');
-                            const metricName = firstCell ? firstCell.textContent.trim() : metricId;
-                            
-                            rows.push({
-                                id: metricId,
-                                name: metricName,
-                                values: values
                             });
+                            
+                            // Only add row if we have at least one value and haven't processed this ID
+                            if ((values.length > 0 || metricId) && metricId && !processedIds.has(metricId)) {
+                                processedIds.add(metricId);
+                                rows.push({
+                                    id: metricId,
+                                    name: metricName || metricId,
+                                    values: values
+                                });
+                            }
                         });
                     }
                     
@@ -172,6 +235,9 @@ class FinancialScraper:
                 logger.debug(f"Sample periods: {periods[:3]}")
             if rows:
                 logger.debug(f"Sample row: id={rows[0].get('id')}, name={rows[0].get('name')}, values_count={len(rows[0].get('values', []))}")
+                # Log all metric IDs found
+                all_metric_ids = [row.get('id', '') for row in rows]
+                logger.info(f"Found {len(all_metric_ids)} metric IDs for {ticker_symbol} {statement_type}: {all_metric_ids[:15]}")  # Log first 15
             
             # Create a structured format: {period: {metric_id: value}}
             result = {}
