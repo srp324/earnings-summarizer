@@ -96,3 +96,24 @@ class ChatResponse(BaseModel):
         None,
         description="Analysis result if new analysis was triggered"
     )
+
+
+class SearchHistoryEntry(BaseModel):
+    """A single entry in the search history."""
+    id: str = Field(..., description="Unique entry identifier")
+    timestamp: str = Field(..., description="ISO timestamp when search was performed")
+    ticker_symbol: Optional[str] = Field(None, description="Company ticker symbol")
+    company_name: Optional[str] = Field(None, description="Company name")
+    fiscal_year: Optional[str] = Field(None, description="Fiscal year (e.g., '2024')")
+    fiscal_quarter: Optional[str] = Field(None, description="Fiscal quarter (e.g., '1', '2', '3', '4')")
+    query: str = Field(..., description="Original search query")
+    action: str = Field(..., description="Action type: 'analysis' or 'chat'")
+    message_count: Optional[int] = Field(None, description="Number of messages at this point")
+    messages: Optional[List[Dict[str, Any]]] = Field(None, description="Snapshot of messages at this point")
+
+
+class SearchHistoryResponse(BaseModel):
+    """Response containing session search history."""
+    session_id: str = Field(..., description="Session identifier")
+    searches: List[SearchHistoryEntry] = Field(..., description="List of previous searches")
+    total: int = Field(..., description="Total number of searches")

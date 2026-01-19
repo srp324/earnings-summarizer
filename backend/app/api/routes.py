@@ -21,6 +21,8 @@ from app.schemas import (
     SessionListResponse,
     ChatRequest,
     ChatResponse,
+    SearchHistoryResponse,
+    SearchHistoryEntry,
 )
 from app.database import get_db, SearchSession
 from app.agents.earnings_agent import run_earnings_analysis, stream_earnings_analysis
@@ -325,10 +327,51 @@ async def chat_stream(
                 }
                 
                 # Stream analysis with real-time updates
+                # If user didn't specify a new ticker, use ticker from last analysis
+                # The conversation router should have already added it to company_query, but we'll pass it to the agent as well
+                initial_ticker = None
+                if session.last_analysis and session.last_analysis.get('ticker_symbol'):
+                    # Check if company_query actually contains a ticker (not just year/quarter patterns)
+                    # If query looks like just period info (e.g., "2025 Q2", "Q2"), use last_analysis ticker
+                    import re
+                    query_upper = company_query.upper().strip()
+                    # Patterns that indicate just period without ticker
+                    is_just_period = bool(re.match(r'^(FY\s*)?\d{4}\s*(Q[1-4])?$|^Q[1-4](\s+(FY\s*)?\d{4})?$', query_upper))
+                    if is_just_period:
+                        initial_ticker = session.last_analysis.get('ticker_symbol')
+                        logger.info(f"Company query '{company_query}' appears to be just period without ticker, will use '{initial_ticker}' from last_analysis in agent state")
+                    else:
+                        # Query has something else - check if it's actually a ticker pattern
+                        # Look for ticker-like patterns (1-5 uppercase letters, not part of FY/Q pattern)
+                        ticker_match = re.search(r'\b([A-Z]{1,5})\b', query_upper)
+                        if not ticker_match:
+                            initial_ticker = session.last_analysis.get('ticker_symbol')
+                            logger.info(f"Company query '{company_query}' doesn't contain clear ticker, will use '{initial_ticker}' from last_analysis in agent state")
+                
                 final_result = None
                 last_mapped_stage = None  # Track the last mapped stage (with id and label)
                 current_active_stage_id = None  # Track the currently active stage ID
-                async for update in stream_earnings_analysis(company_query):
+                ticker_from_tool_call = None  # Capture ticker from actual tool invocation
+                async for update in stream_earnings_analysis(company_query, initial_ticker_symbol=initial_ticker):
+                    # Extract ticker from tool calls in updates (most reliable - what tool actually used)
+                    if update.get("messages"):
+                        import re
+                        from langchain_core.messages import ToolMessage
+                        for msg in update.get("messages", []):
+                            # Check AIMessage with tool_calls for get_earnings_transcript
+                            if hasattr(msg, 'tool_calls') and msg.tool_calls:
+                                for tool_call in msg.tool_calls:
+                                    tool_name = tool_call.get('name', '') if isinstance(tool_call, dict) else getattr(tool_call, 'name', '')
+                                    if tool_name == 'get_earnings_transcript':
+                                        tool_args = tool_call.get('args', {}) if isinstance(tool_call, dict) else getattr(tool_call, 'args', {})
+                                        symbol = tool_args.get('symbol') if isinstance(tool_args, dict) else None
+                                        if symbol:
+                                            ticker_from_tool_call = symbol.upper()
+                                            logger.info(f"Captured ticker_symbol '{ticker_from_tool_call}' from get_earnings_transcript tool call in stream update")
+                                            break
+                                if ticker_from_tool_call:
+                                    break
+                    
                     # Preserve ticker_symbol from any update that has it
                     if update.get("ticker_symbol") and not final_result:
                         final_result = {}
@@ -449,19 +492,6 @@ async def chat_stream(
                     if previous_ticker_symbol:
                         logger.info(f"Found previous ticker_symbol '{previous_ticker_symbol}' from last_analysis - will use for scraping if current result doesn't have one")
                 
-                # Store analysis in session
-                analysis_data = {
-                    "company_query": company_query,
-                    "summary": result.get("summary"),
-                    "messages": result.get("messages", []),
-                    "timestamp": datetime.utcnow().isoformat(),
-                    "ticker_symbol": result.get("ticker_symbol"),
-                    "company_name": result.get("company_name"),
-                    "requested_fiscal_year": result.get("requested_fiscal_year"),
-                    "requested_quarter": result.get("requested_quarter"),
-                }
-                session.set_analysis(analysis_data)
-                
                 # Get the summary
                 summary = result.get("summary")
                 
@@ -486,8 +516,22 @@ async def chat_stream(
                 if not summary or (len(summary.strip()) < 50 and "specify which quarter" not in summary.lower() and "need you to specify" not in summary.lower()):
                     summary = "Unable to generate a comprehensive summary. The transcript may not have been fully extracted, or there was an error processing it."
                 
-                # Add assistant message to history
+                # Add assistant message to history BEFORE storing in search history
+                # This ensures the summary message is included in the stored conversation snapshot
                 session.add_message("assistant", summary)
+                
+                # Store analysis in session (AFTER adding summary message to conversation_history)
+                analysis_data = {
+                    "company_query": company_query,
+                    "summary": summary,
+                    "messages": result.get("messages", []),
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "ticker_symbol": result.get("ticker_symbol"),
+                    "company_name": result.get("company_name"),
+                    "requested_fiscal_year": result.get("requested_fiscal_year"),
+                    "requested_quarter": result.get("requested_quarter"),
+                }
+                session.set_analysis(analysis_data)
                 
                 # Mark the last active stage as complete when stream finishes
                 if last_mapped_stage and last_mapped_stage.get('id'):
@@ -521,76 +565,77 @@ async def chat_stream(
                 ticker_symbol_for_scraping = None
                 company_name_for_storage = None
                 
-                # Try to extract ticker from transcript source URL first (most reliable - from transcript tool)
-                # The transcript tool successfully retrieved the transcript using the correct ticker in the URL
-                # Format: https://discountingcashflows.com/company/{TICKER}/transcripts/{year}/{quarter}/
-                # Also check: _Source URL: https://discountingcashflows.com/company/SQ/transcripts/2025/2/_
-                ticker_from_url = None
+                # Extract ticker symbol from the actual tool call/invocation (most reliable)
+                # The transcript tool was called with the correct ticker symbol (e.g., 'SQ' for Block)
+                # This is more reliable than extracting from URLs or query text
+                ticker_from_tool = ticker_from_tool_call  # Use ticker captured from stream updates first
                 import re
+                from langchain_core.messages import ToolMessage
                 
-                # Check messages in result
-                messages_to_check = result.get('messages', [])
+                # Check messages in result and final_result for tool calls/invocations
+                messages_to_check = []
+                if result.get('messages'):
+                    messages_to_check.extend(result.get('messages', []))
+                if final_result and final_result.get('messages'):
+                    messages_to_check.extend(final_result.get('messages', []))
+                
                 if messages_to_check:
-                    logger.info(f"Checking {len(messages_to_check)} messages for transcript source URL...")
+                    logger.info(f"Checking {len(messages_to_check)} messages for tool calls/invocations...")
+                    
+                    # Method 1: Check AIMessage tool_calls for get_earnings_transcript invocations
                     for idx, msg in enumerate(messages_to_check):
-                        content = None
-                        if isinstance(msg, dict):
-                            content = msg.get('content', '')
-                        elif hasattr(msg, 'content'):
-                            content = str(msg.content)
-                        
-                        if content and len(content) > 100:  # Only check substantial content
-                            # Look for source URL in transcript content - try multiple patterns
-                            patterns = [
-                                r'_Source URL: https?://[^/\s]+/company/([A-Z]+)/',  # Standard format
-                                r'/company/([A-Z]+)/transcripts/',  # URL pattern anywhere in content
-                                r'company/([A-Z]+)/transcripts/\d{4}/\d',  # More specific pattern
-                            ]
-                            
-                            for pattern in patterns:
-                                url_match = re.search(pattern, content)
-                                if url_match:
-                                    ticker_from_url = url_match.group(1).upper()
-                                    logger.info(f"Extracted ticker_symbol '{ticker_from_url}' from transcript source URL using pattern '{pattern}' (message {idx})")
-                                    break
-                            
-                            if ticker_from_url:
+                        # Check if it's an AIMessage with tool_calls
+                        if hasattr(msg, 'tool_calls') and msg.tool_calls:
+                            for tool_call in msg.tool_calls:
+                                tool_name = tool_call.get('name', '') if isinstance(tool_call, dict) else getattr(tool_call, 'name', '')
+                                if tool_name == 'get_earnings_transcript':
+                                    tool_args = tool_call.get('args', {}) if isinstance(tool_call, dict) else getattr(tool_call, 'args', {})
+                                    symbol = tool_args.get('symbol') if isinstance(tool_args, dict) else None
+                                    if symbol:
+                                        ticker_from_tool = symbol.upper()
+                                        logger.info(f"Extracted ticker_symbol '{ticker_from_tool}' from get_earnings_transcript tool call (message {idx})")
+                                        break
+                            if ticker_from_tool:
                                 break
+                    
+                    # Method 2: Extract from transcript source URL in ToolMessage content
+                    if not ticker_from_tool:
+                        for idx, msg in enumerate(messages_to_check):
+                            # Check ToolMessage content for source URL
+                            if isinstance(msg, ToolMessage) or (hasattr(msg, 'name') and getattr(msg, 'name', '') == 'get_earnings_transcript'):
+                                content = None
+                                if isinstance(msg, dict):
+                                    content = msg.get('content', '')
+                                elif hasattr(msg, 'content'):
+                                    content = str(msg.content)
+                                
+                                if content and len(content) > 100:
+                                    # Look for source URL in transcript content
+                                    patterns = [
+                                        r'_Source URL: https?://[^/\s]+/company/([A-Z]+)/',  # Standard format
+                                        r'/company/([A-Z]+)/transcripts/',  # URL pattern anywhere in content
+                                        r'company/([A-Z]+)/transcripts/\d{4}/\d',  # More specific pattern
+                                    ]
+                                    
+                                    for pattern in patterns:
+                                        url_match = re.search(pattern, content)
+                                        if url_match:
+                                            ticker_from_tool = url_match.group(1).upper()
+                                            logger.info(f"Extracted ticker_symbol '{ticker_from_tool}' from transcript source URL using pattern '{pattern}' (message {idx})")
+                                            break
+                                    
+                                    if ticker_from_tool:
+                                        break
                 
-                # Also check final_result if it has messages (from stream updates)
-                if not ticker_from_url and final_result and final_result.get('messages'):
-                    logger.info(f"Checking {len(final_result.get('messages', []))} messages from final_result for transcript source URL...")
-                    for idx, msg in enumerate(final_result.get('messages', [])):
-                        content = None
-                        if isinstance(msg, dict):
-                            content = msg.get('content', '')
-                        elif hasattr(msg, 'content'):
-                            content = str(msg.content)
-                        
-                        if content and len(content) > 100:
-                            patterns = [
-                                r'_Source URL: https?://[^/\s]+/company/([A-Z]+)/',
-                                r'/company/([A-Z]+)/transcripts/',
-                                r'company/([A-Z]+)/transcripts/\d{4}/\d',
-                            ]
-                            
-                            for pattern in patterns:
-                                url_match = re.search(pattern, content)
-                                if url_match:
-                                    ticker_from_url = url_match.group(1).upper()
-                                    logger.info(f"Extracted ticker_symbol '{ticker_from_url}' from transcript source URL using pattern '{pattern}' (final_result message {idx})")
-                                    break
-                            
-                            if ticker_from_url:
-                                break
-                
-                # Prioritize ticker from transcript URL (most reliable - from transcript tool)
-                # Then use current result's ticker_symbol (from the NEW analysis)
-                # This ensures that if user analyzes "Chubb" after "TSLA", we use "CB" not "TSLA" or "CHUBB"
-                if ticker_from_url:
-                    ticker_symbol_for_scraping = ticker_from_url
-                    company_name_for_storage = result.get('company_name') or ticker_from_url
-                    logger.info(f"Using ticker_symbol '{ticker_symbol_for_scraping}' from transcript source URL for scraping (most reliable)")
+                # Prioritize ticker from tool call/invocation (most reliable - what the tool actually used)
+                # ticker_from_tool may have been captured from stream updates (ticker_from_tool_call)
+                # or extracted from messages below
+                # Then try transcript URL extraction, then current result's ticker_symbol
+                # This ensures that if user analyzes "Block" after "TSLA", we use "SQ" not "BLOCK" or "TSLA"
+                if ticker_from_tool:
+                    ticker_symbol_for_scraping = ticker_from_tool
+                    company_name_for_storage = result.get('company_name') or ticker_from_tool
+                    logger.info(f"Using ticker_symbol '{ticker_symbol_for_scraping}' from transcript tool call for scraping (most reliable - captured from stream or messages)")
                 elif result.get('ticker_symbol'):
                     ticker_symbol_for_scraping = result.get('ticker_symbol')
                     company_name_for_storage = result.get('company_name') or result.get('ticker_symbol')
@@ -646,6 +691,13 @@ async def chat_stream(
             else:  # action == "chat"
                 # Generate chat response
                 yield f"data: {json.dumps({'type': 'status', 'session_id': session.session_id, 'stage': 'thinking', 'message': 'Generating response...'})}\n\n"
+                
+                # Add search entry for first chat message (if it's a new conversation)
+                if not session.search_history and not session.last_analysis:
+                    session.add_search_entry(
+                        query=request.message,
+                        action="chat"
+                    )
                 
                 response_message = await create_chat_response(
                     user_input=request.message,
@@ -841,6 +893,13 @@ async def chat(
             )
         
         else:  # action == "chat"
+            # Add search entry for first chat message (if it's a new conversation)
+            if not session.search_history and not session.last_analysis:
+                session.add_search_entry(
+                    query=request.message,
+                    action="chat"
+                )
+            
             # Generate chat response
             response_message = await create_chat_response(
                 user_input=request.message,
@@ -1026,4 +1085,70 @@ async def get_metrics_history_endpoint(
         })
     
     return {"ticker_symbol": ticker_symbol.upper(), "history": results}
+
+
+@router.get("/sessions/{session_id}/history", response_model=SearchHistoryResponse)
+async def get_session_search_history(
+    session_id: str,
+):
+    """Get search history for a session."""
+    session_manager = get_session_manager()
+    session = session_manager.get_session(session_id)
+    
+    if not session:
+        # Return empty history if session doesn't exist
+        return SearchHistoryResponse(
+            session_id=session_id,
+            searches=[],
+            total=0
+        )
+    
+    history = session.get_search_history()
+    
+    # Convert to SearchHistoryEntry objects (include messages for restoration)
+    search_entries = [
+        SearchHistoryEntry(
+            id=entry["id"],
+            timestamp=entry["timestamp"],
+            ticker_symbol=entry.get("ticker_symbol"),
+            company_name=entry.get("company_name"),
+            fiscal_year=entry.get("fiscal_year"),
+            fiscal_quarter=entry.get("fiscal_quarter"),
+            query=entry.get("query", ""),
+            action=entry.get("action", "chat"),
+            message_count=entry.get("message_count"),
+            messages=entry.get("messages")  # Include messages for restoration
+        )
+        for entry in history
+    ]
+    
+    return SearchHistoryResponse(
+        session_id=session_id,
+        searches=search_entries,
+        total=len(search_entries)
+    )
+
+
+@router.get("/sessions/{session_id}/history/{search_id}/messages")
+async def get_search_entry_messages(
+    session_id: str,
+    search_id: str,
+):
+    """Get messages for a specific search entry to restore conversation state."""
+    session_manager = get_session_manager()
+    session = session_manager.get_session(session_id)
+    
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    messages = session.get_search_entry_messages(search_id)
+    
+    if messages is None:
+        raise HTTPException(status_code=404, detail="Search entry not found")
+    
+    return {
+        "session_id": session_id,
+        "search_id": search_id,
+        "messages": messages
+    }
 

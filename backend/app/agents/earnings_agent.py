@@ -143,7 +143,12 @@ def create_earnings_agent():
                 logger.warning(f"Could not extract both fiscal_year and quarter from query: {user_query}")
         
         # Try to extract ticker symbol from user query
+        # PRIORITY 1: Use ticker from state (may be from previous analysis)
         ticker_symbol = state.get("ticker_symbol")
+        if ticker_symbol:
+            logger.info(f"Using ticker_symbol '{ticker_symbol}' from state (may be from previous analysis)")
+        
+        # PRIORITY 2: Try to extract ticker from user_query if not in state
         if not ticker_symbol and user_query:
             # Look for ticker-like patterns (1-5 uppercase letters, possibly preceded by $)
             ticker_patterns = [
@@ -168,7 +173,7 @@ def create_earnings_agent():
                     'amazon': 'AMZN', 'meta': 'META', 'facebook': 'META', 'nvidia': 'NVDA',
                     'tesla': 'TSLA', 'netflix': 'NFLX', 'amd': 'AMD', 'intel': 'INTC',
                     'salesforce': 'CRM', 'oracle': 'ORCL', 'adobe': 'ADBE', 'ibm': 'IBM',
-                    'cisco': 'CSCO',
+                    'cisco': 'CSCO', 'block': 'SQ', 'chubb': 'CB', 'square': 'SQ',
                 }
                 
                 query_lower = user_query.lower()
@@ -177,6 +182,17 @@ def create_earnings_agent():
                         ticker_symbol = ticker
                         logger.info(f"Identified ticker {ticker_symbol} from company name: {company}")
                         break
+        
+        # If still no ticker and query only contains year/quarter (no company name), 
+        # the conversation router should have already added the ticker from last_analysis
+        # But if we still don't have one, preserve state's ticker as a fallback
+        if not ticker_symbol:
+            # Check if query looks like it's just year/quarter without ticker
+            query_stripped = user_query.strip() if user_query else ""
+            looks_like_just_period = bool(re.match(r'^(FY\s*)?\d{4}\s*(Q[1-4])?$|^Q[1-4](\s+(FY\s*)?\d{4})?$', query_stripped, re.I))
+            if looks_like_just_period and state.get("ticker_symbol"):
+                ticker_symbol = state.get("ticker_symbol")
+                logger.info(f"Query appears to be just period without ticker, using ticker_symbol '{ticker_symbol}' from state")
         
         # Build system prompt based on whether year and quarter were extracted
         has_year_and_quarter = requested_fiscal_year is not None and requested_quarter is not None
@@ -1199,15 +1215,21 @@ async def run_earnings_analysis(company_query: str) -> Dict[str, Any]:
     }
 
 
-async def stream_earnings_analysis(company_query: str):
-    """Stream the earnings analysis process, yielding updates at each step."""
+async def stream_earnings_analysis(company_query: str, initial_ticker_symbol: Optional[str] = None):
+    """Stream the earnings analysis process, yielding updates at each step.
+    
+    Args:
+        company_query: The company query from the user
+        initial_ticker_symbol: Optional ticker symbol to use if query doesn't contain one
+                              (e.g., from previous analysis)
+    """
     
     agent = create_earnings_agent()
     
     initial_state: EarningsAgentState = {
         "messages": [HumanMessage(content=f"Please analyze and summarize the earnings reports for: {company_query}")],
         "company_query": company_query,
-        "ticker_symbol": None,
+        "ticker_symbol": initial_ticker_symbol,  # Use provided ticker if available
         "company_name": None,
         "summary": None,
         "current_stage": "analyzing_query",
@@ -1216,6 +1238,9 @@ async def stream_earnings_analysis(company_query: str):
         "requested_quarter": None,
         "transcript_retrieved": False,
     }
+    
+    if initial_ticker_symbol:
+        logger.info(f"Initializing earnings agent with ticker_symbol '{initial_ticker_symbol}' from previous analysis")
     
     # Stream the agent execution
     current_state = initial_state.copy()

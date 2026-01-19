@@ -1,8 +1,9 @@
 import { useState, useRef, useEffect } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
-import { Send, TrendingUp, Loader2, Sparkles, BarChart3, Search, CheckCircle, AlertCircle, ChevronDown, ChevronUp } from 'lucide-react'
+import { Send, TrendingUp, Loader2, Sparkles, BarChart3, Search, CheckCircle, AlertCircle, ChevronDown, ChevronUp, History } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import { MetricsDashboard } from './components/MetricsDashboard'
+import { SearchHistorySidebar } from './components/SearchHistorySidebar'
 
 interface Message {
   id: string
@@ -13,6 +14,23 @@ interface Message {
   tickerSymbol?: string // Ticker symbol for financial dashboard
   companyName?: string // Company name for financial dashboard
   isMetricsLoading?: boolean // Flag to show loading state for metrics dashboard
+}
+
+interface SearchHistoryEntry {
+  id: string
+  timestamp: string
+  ticker_symbol?: string
+  company_name?: string
+  fiscal_year?: string
+  fiscal_quarter?: string
+  query: string
+  action: string
+  message_count?: number
+  messages?: Array<{
+    role: string
+    content: string
+    timestamp?: string
+  }>
 }
 
 interface AnalysisStage {
@@ -36,10 +54,17 @@ function App() {
   const [currentStages, setCurrentStages] = useState<AnalysisStage[]>(stages)
   const [showWelcome, setShowWelcome] = useState(true)
   const [sessionId, setSessionId] = useState<string | null>(null)
+  const sessionIdRef = useRef<string | null>(null) // Keep ref in sync for synchronous access
   const [isAnalyzing, setIsAnalyzing] = useState(false)
   const [expandedStages, setExpandedStages] = useState<Set<string>>(new Set())
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const stagesRef = useRef<AnalysisStage[]>(stages)
+  const [sidebarOpen, setSidebarOpen] = useState(false)
+  
+  // Keep ref in sync with state
+  useEffect(() => {
+    sessionIdRef.current = sessionId
+  }, [sessionId])
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -68,32 +93,36 @@ function App() {
     })
   }
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault()
-    if (!input.trim() || isLoading) return
+  const submitQuery = async (query: string) => {
+    if (!query.trim() || isLoading) return
 
     const userMessage: Message = {
       id: Date.now().toString(),
       role: 'user',
-      content: input.trim(),
+      content: query.trim(),
       timestamp: new Date(),
     }
 
     setMessages(prev => [...prev, userMessage])
-    const currentInput = input.trim()
+    const currentInput = query.trim()
     setInput('')
     setIsLoading(true)
     setShowWelcome(false)
 
     try {
       // Use the streaming chat endpoint for real-time updates
+      // Use ref value to ensure we have the latest session_id synchronously
+      const currentSessionId = sessionIdRef.current || sessionId
+      const payload = { 
+        message: currentInput,
+        session_id: currentSessionId 
+      }
+      console.log('[App] Sending request with payload:', payload, '(sessionId state:', sessionId, ', ref:', sessionIdRef.current, ')')
+      
       const response = await fetch('/api/v1/chat/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
-          message: currentInput,
-          session_id: sessionId 
-        }),
+        body: JSON.stringify(payload),
       })
 
       if (!response.ok) {
@@ -140,6 +169,14 @@ function App() {
                   // Status update - show thinking indicator
                   if (data.stage === 'thinking') {
                     setIsAnalyzing(false)
+                  }
+                  // Capture session_id from status events (backend sends it in initial status event)
+                  if (data.session_id) {
+                    console.log('[App] Received session_id from status event:', data.session_id)
+                    receivedSessionId = data.session_id
+                    // Update both ref (synchronous) and state (async) immediately
+                    sessionIdRef.current = data.session_id
+                    setSessionId(data.session_id)
                   }
                 } else if (data.type === 'reasoning') {
                   // Reasoning event - show AI reasoning as a visible step
@@ -231,7 +268,12 @@ function App() {
                 } else if (data.type === 'complete') {
                   // Final result received
                   assistantContent = data.message || assistantContent
-                  receivedSessionId = data.session_id || receivedSessionId
+                  if (data.session_id && data.session_id !== receivedSessionId) {
+                    receivedSessionId = data.session_id
+                    // Update both ref (synchronous) and state (async) immediately
+                    sessionIdRef.current = data.session_id
+                    setSessionId(data.session_id)
+                  }
                   actionTaken = data.action_taken || 'chat'
                   
                   // If this was an analysis, create a message with the stage flow before hiding it
@@ -311,6 +353,14 @@ function App() {
                   // Error occurred
                   assistantContent = data.message || data.error || 'An error occurred'
                   
+                  // Capture session_id from error events if present
+                  if (data.session_id) {
+                    receivedSessionId = data.session_id
+                    // Update both ref (synchronous) and state (async) immediately
+                    sessionIdRef.current = data.session_id
+                    setSessionId(data.session_id)
+                  }
+                  
                   // Update stages to show error
                   if (isAnalyzing) {
                     setCurrentStages(prev => {
@@ -323,6 +373,18 @@ function App() {
                     setIsAnalyzing(false)
                   }
                 }
+                
+                // Always try to capture session_id from any event that has it
+                // Update if we have a session_id and either we don't have one yet, or we got a new one
+                if (data.session_id) {
+                  if (!receivedSessionId || data.session_id !== receivedSessionId) {
+                    console.log('[App] Updating session_id from', receivedSessionId, 'to', data.session_id)
+                    receivedSessionId = data.session_id
+                    // Update both ref (synchronous) and state (async) immediately
+                    sessionIdRef.current = data.session_id
+                    setSessionId(data.session_id)
+                  }
+                }
               } catch (parseError) {
                 console.error('Error parsing SSE data:', parseError)
               }
@@ -330,9 +392,13 @@ function App() {
           }
         }
 
-        // Store session ID
-        if (receivedSessionId) {
+        // Final check - ensure session ID is stored (should already be set above, but this is a fallback)
+        if (receivedSessionId && receivedSessionId !== sessionIdRef.current) {
+          console.log('[App] Final check - setting session_id state to:', receivedSessionId)
+          sessionIdRef.current = receivedSessionId
           setSessionId(receivedSessionId)
+        } else if (!receivedSessionId) {
+          console.warn('[App] No session_id received from backend! receivedSessionId is:', receivedSessionId, 'current sessionId state:', sessionId, 'ref:', sessionIdRef.current)
         }
 
         // Add assistant message (summary)
@@ -473,6 +539,11 @@ function App() {
     }
   }
 
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault()
+    await submitQuery(input)
+  }
+
   const exampleQueries = [
     'Apple',
     'NVDA',
@@ -496,7 +567,14 @@ function App() {
           animate={{ opacity: 1, y: 0 }}
           className="text-center mb-8"
         >
-          <div className="flex items-center justify-center gap-3 mb-3">
+          <div className="flex items-center justify-center gap-3 mb-3 relative">
+            <button
+              onClick={() => setSidebarOpen(true)}
+              className="absolute left-0 p-2 rounded-xl bg-slate-800/50 hover:bg-slate-700/50 border border-slate-700/50 hover:border-ocean-500/50 text-slate-400 hover:text-ocean-400 transition-all duration-300"
+              title="Search History"
+            >
+              <History className="w-5 h-5" />
+            </button>
             <div className="p-3 rounded-2xl bg-gradient-to-br from-ocean-500 to-ocean-700 shadow-lg shadow-ocean-500/25">
               <BarChart3 className="w-8 h-8 text-white" />
             </div>
@@ -845,6 +923,137 @@ function App() {
           <p>Powered by LangChain & LangGraph • Built with React & FastAPI</p>
         </footer>
       </div>
+
+      {/* Search History Sidebar */}
+      <SearchHistorySidebar
+        sessionId={sessionId}
+        isOpen={sidebarOpen}
+        onClose={() => setSidebarOpen(false)}
+        onSearchClick={async (entry: SearchHistoryEntry) => {
+          // Restore conversation state from stored messages
+          if (entry.messages && entry.messages.length > 0) {
+            console.log('[Restore] Restoring entry:', {
+              id: entry.id,
+              action: entry.action,
+              ticker_symbol: entry.ticker_symbol,
+              message_count: entry.messages.length,
+              messages: entry.messages.map(m => ({ role: m.role, content_length: m.content?.length || 0, content_preview: m.content?.substring(0, 50) }))
+            })
+            
+            const restoredMessages: Message[] = []
+            
+            // Process messages and reconstruct full conversation state
+            let messageIndex = 0
+            let hasAddedStageFlow = false
+            let summaryMessageAdded = false
+            
+            // First, find the summary message (last assistant message with content)
+            let summaryMessage: { role: string; content: string; timestamp?: string } | null = null
+            for (let i = entry.messages.length - 1; i >= 0; i--) {
+              const msg = entry.messages[i]
+              if (msg.role === 'assistant' && msg.content && msg.content.trim()) {
+                summaryMessage = msg
+                console.log('[Restore] Found summary message:', { content_length: msg.content.length, content_preview: msg.content.substring(0, 100) })
+                break
+              }
+            }
+            
+            // Process all stored messages in order
+            entry.messages.forEach((msg) => {
+              const timestamp = msg.timestamp ? new Date(msg.timestamp) : new Date(entry.timestamp)
+              
+              // Add user message
+              if (msg.role === 'user') {
+                restoredMessages.push({
+                  id: `${entry.id}-user-${messageIndex++}`,
+                  role: 'user',
+                  content: msg.content || '',
+                  timestamp,
+                })
+                
+                // For analysis entries, add stage flow message after user message
+                if (entry.action === 'analysis' && !hasAddedStageFlow) {
+                  const completedStages: AnalysisStage[] = stages.map(s => ({
+                    ...s,
+                    status: 'complete' as const,
+                    icon: s.icon,
+                    // Note: reasoning is not stored, so stages won't have reasoning on restore
+                  }))
+                  
+                  restoredMessages.push({
+                    id: `${entry.id}-stages`,
+                    role: 'assistant',
+                    content: '',
+                    timestamp,
+                    stages: completedStages
+                  })
+                  hasAddedStageFlow = true
+                }
+              }
+              
+              // Add assistant messages
+              if (msg.role === 'assistant') {
+                // Check if this is the summary message (last assistant message with content)
+                // Use trim for comparison to handle whitespace differences
+                const isSummaryMessage = summaryMessage && 
+                  msg.content && msg.content.trim() !== '' &&
+                  msg.content.trim() === summaryMessage.content.trim()
+                
+                if (isSummaryMessage) {
+                  console.log('[Restore] Processing summary message')
+                }
+                
+                const restoredMessage: Message = {
+                  id: `${entry.id}-assistant-${messageIndex++}`,
+                  role: 'assistant',
+                  content: msg.content || '',
+                  timestamp,
+                }
+                
+                // For analysis entries with ticker, mark summary message and add metrics dashboard
+                if (entry.action === 'analysis' && entry.ticker_symbol && isSummaryMessage && !summaryMessageAdded) {
+                  // This is the summary message - add ticker symbol
+                  restoredMessage.tickerSymbol = entry.ticker_symbol
+                  restoredMessage.companyName = entry.company_name
+                  
+                  console.log('[Restore] Adding summary message with ticker:', entry.ticker_symbol)
+                  restoredMessages.push(restoredMessage)
+                  summaryMessageAdded = true
+                  
+                  // Add metrics dashboard message immediately after summary
+                  console.log('[Restore] Adding metrics dashboard message')
+                  restoredMessages.push({
+                    id: `${entry.id}-metrics`,
+                    role: 'assistant',
+                    content: '',
+                    timestamp: new Date(timestamp.getTime() + 1000), // Slightly after summary
+                    tickerSymbol: entry.ticker_symbol,
+                    companyName: entry.company_name,
+                  })
+                } else {
+                  // All other assistant messages (including non-summary or already processed summary)
+                  // Only skip if this is the summary and we already added it
+                  if (!(isSummaryMessage && summaryMessageAdded)) {
+                    restoredMessages.push(restoredMessage)
+                  }
+                }
+              }
+            })
+            
+            // Restore messages to state
+            setMessages(restoredMessages)
+            setShowWelcome(false)
+            
+            // Scroll to bottom after messages are restored
+            setTimeout(() => {
+              scrollToBottom()
+            }, 100)
+          } else if (entry.query) {
+            // Fallback: if no messages stored, restore by re-submitting query
+            submitQuery(entry.query)
+          }
+        }}
+      />
     </div>
   )
 }

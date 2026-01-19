@@ -13,9 +13,12 @@ from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, Tool
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
 import re
+import logging
 
 from app.config import get_settings
 from app.tools.investor_relations import TranscriptListTool
+
+logger = logging.getLogger(__name__)
 
 
 class IntentClassification(BaseModel):
@@ -222,28 +225,43 @@ them in your extracted_company field (e.g., "NVDA 2022 Q1").""")
                 is_quarter_year = bool(re.match(r'^Q[1-4]\s+(20\d{2}|FY\s*20\d{2})$', user_lower))
                 
                 if is_just_quarter or is_just_year or is_quarter_year:
-                    # Look for company/ticker and year in previous user messages
+                    # If user didn't specify a new ticker, use the ticker from last analysis
+                    # This allows queries like "Q2" or "2025 Q2" to use the previous company
                     ticker = None
                     year = None
                     
-                    for msg in reversed(conversation_history):
-                        if msg.get("role") == "user":
-                            prev_content = msg.get("content", "").strip()
-                            # Extract ticker (1-5 uppercase letters, common ticker pattern)
-                            if not ticker:
+                    # PRIORITY 1: Use ticker from last_analysis (most reliable)
+                    if last_analysis and last_analysis.get('ticker_symbol'):
+                        ticker = last_analysis.get('ticker_symbol')
+                        logger.info(f"Using ticker_symbol '{ticker}' from last_analysis for incomplete query: {user_input}")
+                    
+                    # PRIORITY 2: Extract year from last_analysis if available
+                    if not year and last_analysis:
+                        # Try to get year from last analysis (might not have it, but worth checking)
+                        if last_analysis.get('requested_fiscal_year'):
+                            year = last_analysis.get('requested_fiscal_year')
+                    
+                    # PRIORITY 3: Fallback - Look for company/ticker and year in previous user messages
+                    if not ticker:
+                        for msg in reversed(conversation_history):
+                            if msg.get("role") == "user":
+                                prev_content = msg.get("content", "").strip()
+                                # Extract ticker (1-5 uppercase letters, common ticker pattern)
                                 ticker_match = re.search(r'\b([A-Z]{1,5})\b', prev_content.upper())
                                 if ticker_match:
                                     ticker = ticker_match.group(1)
-                            
-                            # Extract year
-                            if not year:
+                                    break
+                    
+                    # Extract year from user input or conversation history if not from last_analysis
+                    if not year:
+                        for msg in reversed(conversation_history):
+                            if msg.get("role") == "user":
+                                prev_content = msg.get("content", "").strip()
+                                # Extract year
                                 year_match = re.search(r'(?:FY\s*)?(20\d{2})', prev_content)
                                 if year_match:
                                     year = year_match.group(1)
-                            
-                            # If we found both, we can build the query
-                            if ticker and year:
-                                break
+                                    break
                     
                     # Build complete query if we found missing pieces
                     if ticker:
@@ -256,6 +274,10 @@ them in your extracted_company field (e.g., "NVDA 2022 Q1").""")
                         elif is_quarter_year:
                             # User provided quarter and year, just need ticker
                             company_query = f"{ticker} {user_input}"
+                    else:
+                        # No ticker found - user needs to specify one
+                        # But this should be handled by the classifier/agent, so log warning
+                        logger.warning(f"Could not find ticker symbol for incomplete query: {user_input}. User may need to specify company/ticker.")
             
             # Use full company_query to preserve fiscal year/quarter information
             # The agent will extract the company name and fiscal details separately

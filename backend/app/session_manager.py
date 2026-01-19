@@ -22,6 +22,7 @@ class SessionData:
         self.conversation_history: List[Dict[str, Any]] = []
         self.last_analysis: Optional[Dict[str, Any]] = None
         self.metadata: Dict[str, Any] = {}
+        self.search_history: List[Dict[str, Any]] = []  # Track previous searches
     
     def add_message(self, role: str, content: str):
         """Add a message to conversation history."""
@@ -36,6 +37,55 @@ class SessionData:
         """Store the latest analysis result."""
         self.last_analysis = analysis
         self.last_accessed = datetime.utcnow()
+        
+        # Add to search history when analysis is completed
+        # Store a snapshot of the conversation at this point
+        search_entry = {
+            "id": str(uuid.uuid4()),
+            "timestamp": datetime.utcnow().isoformat(),
+            "ticker_symbol": analysis.get("ticker_symbol"),
+            "company_name": analysis.get("company_name"),
+            "fiscal_year": analysis.get("requested_fiscal_year"),
+            "fiscal_quarter": analysis.get("requested_quarter"),
+            "query": analysis.get("company_query", ""),
+            "action": "analysis",
+            "message_count": len(self.conversation_history),  # Store how many messages at this point
+            "messages": self.conversation_history.copy()  # Store snapshot of messages
+        }
+        self.search_history.append(search_entry)
+        # Keep only last 50 searches to avoid memory issues
+        if len(self.search_history) > 50:
+            self.search_history = self.search_history[-50:]
+    
+    def add_search_entry(self, query: str, action: str = "chat", ticker_symbol: Optional[str] = None, 
+                        fiscal_year: Optional[str] = None, fiscal_quarter: Optional[str] = None):
+        """Add a search entry for general chat messages (first message in conversation)."""
+        # Only add if it's the first message or if it's a chat without analysis
+        if action == "chat" and not self.search_history:
+            search_entry = {
+                "id": str(uuid.uuid4()),
+                "timestamp": datetime.utcnow().isoformat(),
+                "ticker_symbol": ticker_symbol,
+                "company_name": None,
+                "fiscal_year": fiscal_year,
+                "fiscal_quarter": fiscal_quarter,
+                "query": query[:100] if len(query) > 100 else query,  # Truncate long queries
+                "action": action,
+                "message_count": len(self.conversation_history),  # Store how many messages at this point
+                "messages": self.conversation_history.copy()  # Store snapshot of messages
+            }
+            self.search_history.append(search_entry)
+    
+    def get_search_entry_messages(self, search_id: str) -> Optional[List[Dict[str, Any]]]:
+        """Get the messages for a specific search entry."""
+        for entry in self.search_history:
+            if entry.get("id") == search_id:
+                return entry.get("messages", [])
+        return None
+    
+    def get_search_history(self) -> List[Dict[str, Any]]:
+        """Get search history sorted by most recent first."""
+        return sorted(self.search_history, key=lambda x: x.get("timestamp", ""), reverse=True)
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert session to dictionary."""
@@ -45,7 +95,8 @@ class SessionData:
             "last_accessed": self.last_accessed.isoformat(),
             "conversation_history": self.conversation_history,
             "last_analysis": self.last_analysis,
-            "metadata": self.metadata
+            "metadata": self.metadata,
+            "search_history": self.get_search_history()
         }
 
 
