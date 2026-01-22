@@ -1174,3 +1174,57 @@ async def get_search_entry_messages(
         "messages": messages
     }
 
+
+@router.post("/sessions/{session_id}/save-conversation")
+async def save_current_conversation(
+    session_id: str,
+):
+    """
+    Save the current conversation to search history.
+    This is useful when the user wants to save their conversation before navigating away.
+    """
+    session_manager = get_session_manager()
+    session = session_manager.get_session(session_id)
+    
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    # Only save if there are messages in the conversation
+    if not session.conversation_history:
+        return {
+            "session_id": session_id,
+            "saved": False,
+            "message": "No conversation to save"
+        }
+    
+    # Check if this conversation has already been saved (to avoid duplicates)
+    # We'll check if the last search entry has the same message count
+    existing_history = session.get_search_history()
+    if existing_history:
+        last_entry = existing_history[0]  # Most recent entry
+        if last_entry.get("message_count") == len(session.conversation_history):
+            # Same number of messages - likely already saved
+            return {
+                "session_id": session_id,
+                "saved": False,
+                "message": "Conversation already saved"
+            }
+    
+    # Extract query from first user message
+    first_user_message = None
+    for msg in session.conversation_history:
+        if msg.get("role") == "user":
+            first_user_message = msg.get("content", "")
+            break
+    
+    # Save as a chat entry
+    session.add_search_entry(
+        query=first_user_message or "Conversation",
+        action="chat"
+    )
+    
+    return {
+        "session_id": session_id,
+        "saved": True,
+        "message": "Conversation saved successfully"
+    }

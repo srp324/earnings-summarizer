@@ -60,6 +60,8 @@ function App() {
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const stagesRef = useRef<AnalysisStage[]>(stages)
   const [sidebarOpen, setSidebarOpen] = useState(false)
+  const abortControllerRef = useRef<AbortController | null>(null)
+  const isCancelledRef = useRef<boolean>(false)
   
   // Keep ref in sync with state
   useEffect(() => {
@@ -96,6 +98,19 @@ function App() {
   const submitQuery = async (query: string) => {
     if (!query.trim() || isLoading) return
 
+    // Cancel any ongoing request
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort()
+      abortControllerRef.current = null
+    }
+
+    // Reset cancellation flag
+    isCancelledRef.current = false
+
+    // Create new AbortController for this request
+    const abortController = new AbortController()
+    abortControllerRef.current = abortController
+
     const userMessage: Message = {
       id: Date.now().toString(),
       role: 'user',
@@ -123,6 +138,7 @@ function App() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
+        signal: abortController.signal,
       })
 
       if (!response.ok) {
@@ -150,9 +166,23 @@ function App() {
         let metricsLoadingMessageId: string | undefined
 
         while (true) {
+          // Check if request was cancelled
+          if (isCancelledRef.current || abortController.signal.aborted) {
+            console.log('[App] Request cancelled, stopping stream processing')
+            reader.cancel()
+            break
+          }
+
           const { done, value } = await reader.read()
           
           if (done) break
+
+          // Check again after read
+          if (isCancelledRef.current || abortController.signal.aborted) {
+            console.log('[App] Request cancelled after read, stopping stream processing')
+            reader.cancel()
+            break
+          }
 
           buffer += decoder.decode(value, { stream: true })
           const lines = buffer.split('\n\n')
@@ -164,14 +194,20 @@ function App() {
                 const data = JSON.parse(line.slice(6))
                 console.log('[SSE Event]', data.type, data)  // Log all SSE events
                 
+                // Check if cancelled before processing event
+                if (isCancelledRef.current || abortController.signal.aborted) {
+                  console.log('[App] Request cancelled, ignoring event:', data.type)
+                  break
+                }
+
                 // Handle different event types
                 if (data.type === 'status') {
                   // Status update - show thinking indicator
                   if (data.stage === 'thinking') {
-                    setIsAnalyzing(false)
+                    if (!isCancelledRef.current) setIsAnalyzing(false)
                   }
                   // Capture session_id from status events (backend sends it in initial status event)
-                  if (data.session_id) {
+                  if (data.session_id && !isCancelledRef.current) {
                     console.log('[App] Received session_id from status event:', data.session_id)
                     receivedSessionId = data.session_id
                     // Update both ref (synchronous) and state (async) immediately
@@ -192,10 +228,10 @@ function App() {
                   })
                   
                   // Mark as analyzing when reasoning is received (stage is active)
-                  setIsAnalyzing(true)
+                  if (!isCancelledRef.current) setIsAnalyzing(true)
                   
                   // Update the stage with reasoning and mark as active
-                  if (reasoning && reasoning.trim()) {
+                  if (reasoning && reasoning.trim() && !isCancelledRef.current) {
                     setCurrentStages(prev => {
                       const updated = prev.map(s => {
                         if (s.id === stageId) {
@@ -219,7 +255,7 @@ function App() {
                   }
                 } else if (data.type === 'stage_update') {
                   // Stage update - update UI in real-time
-                  setIsAnalyzing(true)
+                  if (!isCancelledRef.current) setIsAnalyzing(true)
                   const stageId = data.stage_id
                   const status: 'pending' | 'active' | 'complete' | 'error' = 
                     data.status === 'active' ? 'active' : 
@@ -238,35 +274,41 @@ function App() {
                   })
                   
                   // Update the specific stage with label and reasoning if provided by backend
-                  setCurrentStages(prev => {
-                    const updated = prev.map((s) => {
-                      if (s.id === stageId) {
-                        // Update the target stage
-                        const hasNewReasoning = reasoning !== undefined && reasoning !== null && reasoning.trim().length > 0
-                        const newReasoning = hasNewReasoning ? reasoning : s.reasoning
-                        
-                        // Auto-expand reasoning when it first appears
-                        if (hasNewReasoning && !s.reasoning) {
-                          setExpandedStages(prevExpanded => new Set([...prevExpanded, stageId]))
+                  if (!isCancelledRef.current) {
+                    setCurrentStages(prev => {
+                      const updated = prev.map((s) => {
+                        if (s.id === stageId) {
+                          // Update the target stage
+                          const hasNewReasoning = reasoning !== undefined && reasoning !== null && reasoning.trim().length > 0
+                          const newReasoning = hasNewReasoning ? reasoning : s.reasoning
+                          
+                          // Auto-expand reasoning when it first appears
+                          if (hasNewReasoning && !s.reasoning) {
+                            setExpandedStages(prevExpanded => new Set([...prevExpanded, stageId]))
+                          }
+                          
+                          return {
+                            ...s, 
+                            label: data.stage_label || s.label, 
+                            status,
+                            reasoning: newReasoning
+                          }
                         }
                         
-                        return {
-                          ...s, 
-                          label: data.stage_label || s.label, 
-                          status,
-                          reasoning: newReasoning
-                        }
-                      }
-                      
-                      // Leave other stages unchanged - backend will explicitly send 'complete' status
-                      // for previous stages when transitioning to new stages
-                      return s
+                        // Leave other stages unchanged - backend will explicitly send 'complete' status
+                        // for previous stages when transitioning to new stages
+                        return s
+                      })
+                      stagesRef.current = updated
+                      return updated
                     })
-                    stagesRef.current = updated
-                    return updated
-                  })
+                  }
                 } else if (data.type === 'complete') {
                   // Final result received
+                  if (isCancelledRef.current) {
+                    console.log('[App] Request cancelled, ignoring complete event')
+                    break
+                  }
                   assistantContent = data.message || assistantContent
                   if (data.session_id && data.session_id !== receivedSessionId) {
                     receivedSessionId = data.session_id
@@ -277,7 +319,7 @@ function App() {
                   actionTaken = data.action_taken || 'chat'
                   
                   // If this was an analysis, create a message with the stage flow before hiding it
-                  if (actionTaken === 'analysis_triggered') {
+                  if (actionTaken === 'analysis_triggered' && !isCancelledRef.current) {
                     // Capture current stages from ref
                     const currentStagesSnapshot = stagesRef.current
                     
@@ -306,6 +348,7 @@ function App() {
                     setIsAnalyzing(false)
                   }
                 } else if (data.type === 'metrics_dashboard_loading') {
+                  if (isCancelledRef.current) break
                   // Store loading message info - we'll add it after the summary
                   // DON'T overwrite assistantContent - that contains the summary!
                   metricsLoadingMessageId = `metrics-loading-${Date.now()}`
@@ -313,6 +356,7 @@ function App() {
                   pendingMetricsCompany = data.company_name
                   console.log('[App] Received metrics_dashboard_loading for', data.ticker_symbol, 'messageId:', metricsLoadingMessageId)
                 } else if (data.type === 'metrics_dashboard') {
+                  if (isCancelledRef.current) break
                   // Replace loading message with actual dashboard
                   pendingMetricsTicker = data.ticker_symbol
                   pendingMetricsCompany = data.company_name
@@ -350,6 +394,7 @@ function App() {
                     return prev
                   })
                 } else if (data.type === 'error') {
+                  if (isCancelledRef.current) break
                   // Error occurred
                   assistantContent = data.message || data.error || 'An error occurred'
                   
@@ -362,7 +407,7 @@ function App() {
                   }
                   
                   // Update stages to show error
-                  if (isAnalyzing) {
+                  if (isAnalyzing && !isCancelledRef.current) {
                     setCurrentStages(prev => {
                       const updated = prev.map(s => 
                         s.status === 'active' ? { ...s, status: 'error' as const } : s
@@ -393,16 +438,18 @@ function App() {
         }
 
         // Final check - ensure session ID is stored (should already be set above, but this is a fallback)
-        if (receivedSessionId && receivedSessionId !== sessionIdRef.current) {
-          console.log('[App] Final check - setting session_id state to:', receivedSessionId)
-          sessionIdRef.current = receivedSessionId
-          setSessionId(receivedSessionId)
-        } else if (!receivedSessionId) {
-          console.warn('[App] No session_id received from backend! receivedSessionId is:', receivedSessionId, 'current sessionId state:', sessionId, 'ref:', sessionIdRef.current)
+        if (!isCancelledRef.current) {
+          if (receivedSessionId && receivedSessionId !== sessionIdRef.current) {
+            console.log('[App] Final check - setting session_id state to:', receivedSessionId)
+            sessionIdRef.current = receivedSessionId
+            setSessionId(receivedSessionId)
+          } else if (!receivedSessionId) {
+            console.warn('[App] No session_id received from backend! receivedSessionId is:', receivedSessionId, 'current sessionId state:', sessionId, 'ref:', sessionIdRef.current)
+          }
         }
 
-        // Add assistant message (summary)
-        if (assistantContent) {
+        // Add assistant message (summary) - only if not cancelled
+        if (assistantContent && !isCancelledRef.current) {
           const summaryMessage: Message = {
             id: (Date.now() + 1).toString(),
             role: 'assistant',
@@ -514,28 +561,42 @@ function App() {
         }
       }
     } catch (error) {
-      console.error('Chat error:', error)
-      const errorMessage: Message = {
-        id: (Date.now() + 1).toString(),
-        role: 'assistant',
-        content: 'Sorry, there was an error processing your request. Please ensure the backend server is running and try again.',
-        timestamp: new Date(),
+      // Don't show error if request was cancelled
+      if (isCancelledRef.current || (error instanceof Error && error.name === 'AbortError')) {
+        console.log('[App] Request was cancelled')
+        return
       }
-      setMessages(prev => [...prev, errorMessage])
       
-      // Update stages to show error if we were analyzing
-      if (isAnalyzing) {
-        setCurrentStages(prev => {
-          const updated = prev.map(s => 
-            s.status === 'active' ? { ...s, status: 'error' as const } : s
-          )
-          stagesRef.current = updated
-          return updated
-        })
-        setIsAnalyzing(false)
+      console.error('Chat error:', error)
+      if (!isCancelledRef.current) {
+        const errorMessage: Message = {
+          id: (Date.now() + 1).toString(),
+          role: 'assistant',
+          content: 'Sorry, there was an error processing your request. Please ensure the backend server is running and try again.',
+          timestamp: new Date(),
+        }
+        setMessages(prev => [...prev, errorMessage])
+        
+        // Update stages to show error if we were analyzing
+        if (isAnalyzing) {
+          setCurrentStages(prev => {
+            const updated = prev.map(s => 
+              s.status === 'active' ? { ...s, status: 'error' as const } : s
+            )
+            stagesRef.current = updated
+            return updated
+          })
+          setIsAnalyzing(false)
+        }
       }
     } finally {
-      setIsLoading(false)
+      if (!isCancelledRef.current) {
+        setIsLoading(false)
+      }
+      // Clean up abort controller
+      if (abortControllerRef.current === abortController) {
+        abortControllerRef.current = null
+      }
     }
   }
 
@@ -578,9 +639,52 @@ function App() {
             <div className="p-3 rounded-2xl bg-gradient-to-br from-ocean-500 to-ocean-700 shadow-lg shadow-ocean-500/25">
               <BarChart3 className="w-8 h-8 text-white" />
             </div>
-            <h1 className="font-display text-4xl font-bold gradient-text">
+            <button
+              onClick={async () => {
+                // If already on home page with no activity, do nothing (don't scroll)
+                const isOnHomePage = messages.length === 0 && !isLoading && !isAnalyzing && showWelcome
+                if (isOnHomePage) {
+                  return
+                }
+                
+                // Cancel any ongoing request first
+                if (abortControllerRef.current) {
+                  console.log('[App] Cancelling ongoing request')
+                  isCancelledRef.current = true
+                  abortControllerRef.current.abort()
+                  abortControllerRef.current = null
+                }
+                
+                // Stop any ongoing analysis/stages
+                setIsLoading(false)
+                setIsAnalyzing(false)
+                
+                // Save current conversation to search history if there are messages
+                if (messages.length > 0 && sessionId && !isCancelledRef.current) {
+                  try {
+                    await fetch(`/api/v1/sessions/${sessionId}/save-conversation`, {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                    })
+                    console.log('[App] Conversation saved to search history')
+                  } catch (error) {
+                    console.error('[App] Error saving conversation:', error)
+                    // Continue anyway - don't block navigation
+                  }
+                }
+                
+                // Reset UI to home
+                setMessages([])
+                setShowWelcome(true)
+                resetStages()
+                isCancelledRef.current = false // Reset cancellation flag
+                window.scrollTo({ top: 0, behavior: 'smooth' })
+              }}
+              className="font-display text-4xl font-bold gradient-text cursor-pointer hover:opacity-80 transition-opacity duration-300"
+              title="Return to home"
+            >
               Earnings Summarizer
-            </h1>
+            </button>
           </div>
           <p className="text-slate-400 text-lg">
             AI-powered analysis of stock earnings reports
