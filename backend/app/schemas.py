@@ -110,6 +110,7 @@ class SearchHistoryEntry(BaseModel):
     action: str = Field(..., description="Action type: 'analysis' or 'chat'")
     message_count: Optional[int] = Field(None, description="Number of messages at this point")
     messages: Optional[List[Dict[str, Any]]] = Field(None, description="Snapshot of messages at this point")
+    stage_reasoning: Optional[Dict[str, str]] = Field(None, description="Reasoning for each stage: {stage_id: reasoning}")
 
 
 class SearchHistoryResponse(BaseModel):

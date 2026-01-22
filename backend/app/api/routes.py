@@ -267,6 +267,8 @@ async def chat_stream(
         """Generate SSE events during chat/analysis."""
         try:
             # Get or create session
+            # If request.session_id is None, a new session will be created with fresh state
+            # This happens when user goes back to homepage and starts a new conversation
             session_manager = get_session_manager()
             session = session_manager.get_or_create_session(request.session_id)
             
@@ -352,6 +354,7 @@ async def chat_stream(
                 last_mapped_stage = None  # Track the last mapped stage (with id and label)
                 current_active_stage_id = None  # Track the currently active stage ID
                 ticker_from_tool_call = None  # Capture ticker from actual tool invocation
+                stage_reasoning = {}  # Track reasoning for each stage: {stage_id: reasoning}
                 async for update in stream_earnings_analysis(company_query, initial_ticker_symbol=initial_ticker):
                     # Extract ticker from tool calls in updates (most reliable - what tool actually used)
                     if update.get("messages"):
@@ -427,6 +430,59 @@ async def chat_stream(
                     if mapped_stage.get('id') == 'searching':
                         requested_fiscal_year = update.get("requested_fiscal_year")
                         requested_quarter = update.get("requested_quarter")
+                        current_ticker_symbol = update.get("ticker_symbol")
+                        
+                        # Replace any old ticker symbol in the reasoning with the current one
+                        if current_ticker_symbol and enhanced_reasoning:
+                            import re
+                            # First, check if the reasoning already contains the current ticker
+                            # If it does and it's correct, don't do any replacements to avoid duplication
+                            current_ticker_pattern = rf'\b{re.escape(current_ticker_symbol)}\b'
+                            if re.search(current_ticker_pattern, enhanced_reasoning, re.I):
+                                # Current ticker is already in the reasoning, check if it's in the right format
+                                # Look for patterns like "for TSLA", "TSLA FY", etc.
+                                correct_patterns = [
+                                    rf'\bfor\s+{re.escape(current_ticker_symbol)}\b',
+                                    rf'\b{re.escape(current_ticker_symbol)}\s+FY',
+                                    rf'\breport\s+{re.escape(current_ticker_symbol)}\b',
+                                ]
+                                has_correct_format = any(re.search(pattern, enhanced_reasoning, re.I) for pattern in correct_patterns)
+                                
+                                if has_correct_format:
+                                    # Ticker is already correctly formatted, skip replacement to avoid duplication
+                                    logger.debug(f"Current ticker '{current_ticker_symbol}' already correctly formatted in reasoning, skipping replacement")
+                                else:
+                                    # Ticker exists but might be in wrong format, only replace if there's a different ticker
+                                    # Match patterns like "for OLD_TICKER" or "report OLD_TICKER" where OLD_TICKER != current
+                                    ticker_pattern = r'\b(for|report)\s+([A-Z]{1,5})\b(?=\s|FY|Q|$)'
+                                    matches = re.findall(ticker_pattern, enhanced_reasoning, re.I)
+                                    for prefix, old_ticker in matches:
+                                        # Only replace if it's a different ticker
+                                        if old_ticker.upper() != current_ticker_symbol.upper():
+                                            enhanced_reasoning = re.sub(
+                                                rf'\b{re.escape(prefix)}\s+{re.escape(old_ticker)}\b',
+                                                f'{prefix} {current_ticker_symbol}',
+                                                enhanced_reasoning,
+                                                count=1,
+                                                flags=re.I
+                                            )
+                                            logger.info(f"Replaced old ticker '{old_ticker}' with current ticker '{current_ticker_symbol}' in reasoning")
+                                            break  # Only replace first occurrence
+                            else:
+                                # Current ticker not found, look for any ticker to replace
+                                ticker_pattern = r'\b(for|report)\s+([A-Z]{1,5})\b(?=\s|FY|Q|$)'
+                                matches = re.findall(ticker_pattern, enhanced_reasoning, re.I)
+                                for prefix, old_ticker in matches:
+                                    # Replace with current ticker
+                                    enhanced_reasoning = re.sub(
+                                        rf'\b{re.escape(prefix)}\s+{re.escape(old_ticker)}\b',
+                                        f'{prefix} {current_ticker_symbol}',
+                                        enhanced_reasoning,
+                                        count=1,
+                                        flags=re.I
+                                    )
+                                    logger.info(f"Replaced ticker '{old_ticker}' with current ticker '{current_ticker_symbol}' in reasoning")
+                                    break  # Only replace first occurrence
                         
                         fiscal_info_parts = []
                         if requested_fiscal_year:
@@ -442,10 +498,16 @@ async def chat_stream(
                                     enhanced_reasoning = f"{enhanced_reasoning}\n\nRetrieving reports for {fiscal_info}."
                             else:
                                 # Create reasoning if it doesn't exist
-                                enhanced_reasoning = f"Retrieving reports for {fiscal_info}."
+                                if current_ticker_symbol:
+                                    enhanced_reasoning = f"Retrieving reports for {current_ticker_symbol} {fiscal_info}."
+                                else:
+                                    enhanced_reasoning = f"Retrieving reports for {fiscal_info}."
                     
                     # Send reasoning event first if it exists (as a separate visible step)
                     if enhanced_reasoning and enhanced_reasoning.strip():
+                        # Store reasoning for this stage
+                        stage_reasoning[mapped_stage['id']] = enhanced_reasoning
+                        
                         reasoning_data = {
                             'type': 'reasoning',
                             'session_id': session.session_id,
@@ -470,6 +532,12 @@ async def chat_stream(
                     # Also include reasoning in stage_update for backwards compatibility
                     if enhanced_reasoning and enhanced_reasoning.strip():
                         stage_update_data['reasoning'] = enhanced_reasoning
+                        # Store reasoning for this stage
+                        stage_reasoning[mapped_stage['id']] = enhanced_reasoning
+                    elif reasoning and reasoning.strip():
+                        stage_update_data['reasoning'] = reasoning
+                        # Store reasoning for this stage
+                        stage_reasoning[mapped_stage['id']] = reasoning
                     
                     yield f"data: {json.dumps(stage_update_data)}\n\n"
                     
@@ -486,11 +554,13 @@ async def chat_stream(
                 
                 # Use final result from stream if available, otherwise run full analysis
                 if final_result and final_result.get("summary"):
+                    # Prioritize ticker_symbol from tool call (most reliable - what tool actually used)
+                    ticker_symbol_for_result = ticker_from_tool_call or final_result.get("ticker_symbol")
                     result = {
                         "summary": final_result.get("summary"),
                         "messages": final_result.get("messages", []),
                         "error": None,
-                        "ticker_symbol": final_result.get("ticker_symbol"),
+                        "ticker_symbol": ticker_symbol_for_result,
                         "company_name": final_result.get("company_name"),
                         "requested_fiscal_year": final_result.get("requested_fiscal_year"),
                         "requested_quarter": final_result.get("requested_quarter"),
@@ -498,10 +568,16 @@ async def chat_stream(
                 else:
                     # Fallback: run full analysis if stream didn't provide complete result
                     result = await run_earnings_analysis(company_query)
+                    # If we have ticker from tool call, use it (more reliable)
+                    if ticker_from_tool_call and not result.get("ticker_symbol"):
+                        result["ticker_symbol"] = ticker_from_tool_call
                 
                 # Update database
                 db_session.status = "complete" if result.get("summary") else "error"
                 db_session.summary = result.get("summary")
+                # Update ticker_symbol in database session if available
+                if result.get("ticker_symbol"):
+                    db_session.ticker_symbol = result.get("ticker_symbol")
                 await db.commit()
                 
                 # Preserve previous ticker_symbol for scraping (before overwriting with new analysis)
@@ -552,6 +628,7 @@ async def chat_stream(
                     "company_name": result.get("company_name"),
                     "requested_fiscal_year": result.get("requested_fiscal_year"),
                     "requested_quarter": result.get("requested_quarter"),
+                    "stage_reasoning": stage_reasoning,  # Store reasoning for each stage
                 }
                 session.set_analysis(analysis_data)
                 
@@ -1127,7 +1204,7 @@ async def get_session_search_history(
     
     history = session.get_search_history()
     
-    # Convert to SearchHistoryEntry objects (include messages for restoration)
+    # Convert to SearchHistoryEntry objects (include messages and reasoning for restoration)
     search_entries = [
         SearchHistoryEntry(
             id=entry["id"],
@@ -1139,7 +1216,8 @@ async def get_session_search_history(
             query=entry.get("query", ""),
             action=entry.get("action", "chat"),
             message_count=entry.get("message_count"),
-            messages=entry.get("messages")  # Include messages for restoration
+            messages=entry.get("messages"),  # Include messages for restoration
+            stage_reasoning=entry.get("stage_reasoning")  # Include reasoning for restoration
         )
         for entry in history
     ]

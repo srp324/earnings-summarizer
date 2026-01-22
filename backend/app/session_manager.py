@@ -50,7 +50,8 @@ class SessionData:
             "query": analysis.get("company_query", ""),
             "action": "analysis",
             "message_count": len(self.conversation_history),  # Store how many messages at this point
-            "messages": self.conversation_history.copy()  # Store snapshot of messages
+            "messages": self.conversation_history.copy(),  # Store snapshot of messages
+            "stage_reasoning": analysis.get("stage_reasoning", {})  # Store reasoning for each stage
         }
         self.search_history.append(search_entry)
         # Keep only last 50 searches to avoid memory issues
@@ -86,6 +87,20 @@ class SessionData:
     def get_search_history(self) -> List[Dict[str, Any]]:
         """Get search history sorted by most recent first."""
         return sorted(self.search_history, key=lambda x: x.get("timestamp", ""), reverse=True)
+    
+    def clear_conversation_state(self):
+        """Clear conversation state but preserve search history."""
+        self.conversation_history = []
+        self.last_analysis = None
+        self.last_accessed = datetime.utcnow()
+    
+    def reset_session(self):
+        """Reset the entire session to initial state (clears everything including search history)."""
+        self.conversation_history = []
+        self.last_analysis = None
+        self.metadata = {}
+        self.search_history = []
+        self.last_accessed = datetime.utcnow()
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert session to dictionary."""

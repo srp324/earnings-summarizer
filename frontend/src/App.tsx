@@ -31,6 +31,7 @@ interface SearchHistoryEntry {
     content: string
     timestamp?: string
   }>
+  stage_reasoning?: Record<string, string>  // {stage_id: reasoning}
 }
 
 interface AnalysisStage {
@@ -68,13 +69,7 @@ function App() {
     sessionIdRef.current = sessionId
   }, [sessionId])
 
-  const scrollToBottom = () => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }
-
-  useEffect(() => {
-    scrollToBottom()
-  }, [messages])
+  // Removed auto-scroll functionality - user controls scrolling manually
 
   const resetStages = () => {
     const reset = stages.map(s => ({ ...s, status: 'pending' as const, reasoning: undefined }))
@@ -123,6 +118,8 @@ function App() {
     setInput('')
     setIsLoading(true)
     setShowWelcome(false)
+    // Reset stages for new query
+    resetStages()
 
     try {
       // Use the streaming chat endpoint for real-time updates
@@ -339,6 +336,20 @@ function App() {
                       stages: completedStages
                     }
                     
+                    // Preserve expanded state when moving stages to message
+                    // Convert stage IDs to message-based keys and keep them expanded
+                    setExpandedStages(prev => {
+                      const newSet = new Set(prev)
+                      // Add all stages with reasoning to expanded set using message-based keys
+                      completedStages.forEach(stage => {
+                        if (stage.reasoning && stage.reasoning.trim().length > 0) {
+                          const messageStageKey = `${stageFlowMessage.id}-${stage.id}`
+                          newSet.add(messageStageKey)
+                        }
+                      })
+                      return newSet
+                    })
+                    
                     // Add the stage flow message
                     setMessages(prevMessages => [...prevMessages, stageFlowMessage])
                     
@@ -553,7 +564,7 @@ function App() {
           content: assistantContent,
           timestamp: new Date(),
         }
-
+        
         setMessages(prev => [...prev, assistantMessage])
         
         if (data.action_taken === 'analysis_triggered') {
@@ -677,6 +688,9 @@ function App() {
                 setMessages([])
                 setShowWelcome(true)
                 resetStages()
+                // Reset session to start a completely new conversation
+                setSessionId(null)
+                sessionIdRef.current = null
                 isCancelledRef.current = false // Reset cancellation flag
                 window.scrollTo({ top: 0, behavior: 'smooth' })
               }}
@@ -1077,15 +1091,26 @@ function App() {
                 
                 // For analysis entries, add stage flow message after user message
                 if (entry.action === 'analysis' && !hasAddedStageFlow) {
-                  const completedStages: AnalysisStage[] = stages.map(s => ({
-                    ...s,
-                    status: 'complete' as const,
-                    icon: s.icon,
-                    // Note: reasoning is not stored, so stages won't have reasoning on restore
-                  }))
+                  // Restore stages with reasoning if available
+                  const stageMessageId = `${entry.id}-stages`
+                  const completedStages: AnalysisStage[] = stages.map(s => {
+                    const stageWithReasoning: AnalysisStage = {
+                      ...s,
+                      status: 'complete' as const,
+                      icon: s.icon,
+                    }
+                    // Add reasoning if it was stored for this stage
+                    if (entry.stage_reasoning && entry.stage_reasoning[s.id]) {
+                      stageWithReasoning.reasoning = entry.stage_reasoning[s.id]
+                      // Auto-expand reasoning for stages that have it (using correct key format)
+                      const stageKey = `${stageMessageId}-${s.id}`
+                      setExpandedStages(prev => new Set([...prev, stageKey]))
+                    }
+                    return stageWithReasoning
+                  })
                   
                   restoredMessages.push({
-                    id: `${entry.id}-stages`,
+                    id: stageMessageId,
                     role: 'assistant',
                     content: '',
                     timestamp,
@@ -1148,10 +1173,7 @@ function App() {
             setMessages(restoredMessages)
             setShowWelcome(false)
             
-            // Scroll to bottom after messages are restored
-            setTimeout(() => {
-              scrollToBottom()
-            }, 100)
+            // Don't auto-scroll - let user control their view position
           } else if (entry.query) {
             // Fallback: if no messages stored, restore by re-submitting query
             submitQuery(entry.query)

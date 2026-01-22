@@ -17,6 +17,7 @@ interface SearchHistoryEntry {
     content: string
     timestamp?: string
   }>
+  stage_reasoning?: Record<string, string>  // {stage_id: reasoning}
 }
 
 interface SearchHistorySidebarProps {
