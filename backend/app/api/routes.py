@@ -422,17 +422,39 @@ async def chat_stream(
                     # Log all stage updates for debugging
                     logger.info(f"Processing stage update: node={node}, stage={stage}, mapped_stage={mapped_stage.get('id')}, mapped_label={mapped_stage.get('label')}, has_reasoning={bool(reasoning)}")
                     
+                    # Enhance reasoning for "Retrieving Reports" stage with fiscal year and quarter if available
+                    enhanced_reasoning = reasoning
+                    if mapped_stage.get('id') == 'searching':
+                        requested_fiscal_year = update.get("requested_fiscal_year")
+                        requested_quarter = update.get("requested_quarter")
+                        
+                        fiscal_info_parts = []
+                        if requested_fiscal_year:
+                            fiscal_info_parts.append(f"FY{requested_fiscal_year}")
+                        if requested_quarter:
+                            fiscal_info_parts.append(f"Q{requested_quarter}")
+                        
+                        if fiscal_info_parts:
+                            fiscal_info = " ".join(fiscal_info_parts)
+                            if enhanced_reasoning and enhanced_reasoning.strip():
+                                # Append fiscal info to existing reasoning if not already present
+                                if fiscal_info not in enhanced_reasoning:
+                                    enhanced_reasoning = f"{enhanced_reasoning}\n\nRetrieving reports for {fiscal_info}."
+                            else:
+                                # Create reasoning if it doesn't exist
+                                enhanced_reasoning = f"Retrieving reports for {fiscal_info}."
+                    
                     # Send reasoning event first if it exists (as a separate visible step)
-                    if reasoning and reasoning.strip():
+                    if enhanced_reasoning and enhanced_reasoning.strip():
                         reasoning_data = {
                             'type': 'reasoning',
                             'session_id': session.session_id,
                             'stage_id': mapped_stage['id'],
                             'stage_label': mapped_stage['label'],
                             'node': node,
-                            'reasoning': reasoning
+                            'reasoning': enhanced_reasoning
                         }
-                        logger.info(f"Sending reasoning event for stage {mapped_stage['id']}: {reasoning[:100]}...")
+                        logger.info(f"Sending reasoning event for stage {mapped_stage['id']}: {enhanced_reasoning[:100]}...")
                         yield f"data: {json.dumps(reasoning_data)}\n\n"
                     
                     # Send stage update
@@ -446,8 +468,8 @@ async def chat_stream(
                     }
                     
                     # Also include reasoning in stage_update for backwards compatibility
-                    if reasoning and reasoning.strip():
-                        stage_update_data['reasoning'] = reasoning
+                    if enhanced_reasoning and enhanced_reasoning.strip():
+                        stage_update_data['reasoning'] = enhanced_reasoning
                     
                     yield f"data: {json.dumps(stage_update_data)}\n\n"
                     

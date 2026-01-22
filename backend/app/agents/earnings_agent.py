@@ -301,11 +301,13 @@ DO NOT use list_earnings_transcripts - proceed directly to the next step.
             # Check if transcript was already retrieved via tools (before we can check embeddings)
             messages = state.get("messages", [])
             transcript_already_retrieved = False
+            transcript_tool_message = None
             for msg in reversed(messages):
                 if isinstance(msg, ToolMessage):
                     tool_name = getattr(msg, 'name', None)
                     if tool_name == "get_earnings_transcript":
                         transcript_already_retrieved = True
+                        transcript_tool_message = msg
                         logger.info("Transcript already retrieved via tools, will route to store_embeddings")
                         break
             
@@ -413,9 +415,23 @@ DO NOT use list_earnings_transcripts - proceed directly to the next step.
                 # OR when transcript was already retrieved via tools
                 if transcript_already_retrieved:
                     logger.info(f"Transcript already retrieved via tools, routing to store_embeddings")
+                    
+                    # Try to extract fiscal year and quarter from the transcript tool message
+                    extracted_fiscal_year = requested_fiscal_year
+                    extracted_quarter = requested_quarter
+                    
+                    if transcript_tool_message and hasattr(transcript_tool_message, 'content'):
+                        tool_content = str(transcript_tool_message.content)
+                        # Extract from tool response format: "**Period:** FY{year} Q{quarter}\n"
+                        period_match = re.search(r'\*\*Period:\*\*\s*FY\s*(\d{4})\s*Q\s*([1-4])', tool_content, re.I)
+                        if period_match:
+                            extracted_fiscal_year = period_match.group(1)
+                            extracted_quarter = period_match.group(2)
+                            logger.info(f"Extracted fiscal year/quarter from transcript tool message: FY{extracted_fiscal_year} Q{extracted_quarter}")
+                    
                     # Build user-friendly message with ticker/year/quarter if available
-                    if ticker_symbol and requested_fiscal_year and requested_quarter:
-                        message_content = f"Transcript for {ticker_symbol} {requested_fiscal_year}Q{requested_quarter} has been fetched. Preparing for analysis..."
+                    if ticker_symbol and extracted_fiscal_year and extracted_quarter:
+                        message_content = f"Transcript for {ticker_symbol} FY{extracted_fiscal_year} Q{extracted_quarter} has been fetched. Preparing for analysis..."
                     elif ticker_symbol:
                         message_content = f"Latest earnings report transcript for {ticker_symbol} has been fetched. Preparing for analysis..."
                     else:
@@ -426,8 +442,8 @@ DO NOT use list_earnings_transcripts - proceed directly to the next step.
                         "current_stage": "retrieving_transcript",  # Keep as retrieving_transcript to show "Retrieving Reports"
                         "embeddings_exist": False,
                         "ticker_symbol": ticker_symbol,
-                        "requested_fiscal_year": requested_fiscal_year,  # May be None
-                        "requested_quarter": requested_quarter,  # May be None
+                        "requested_fiscal_year": extracted_fiscal_year or requested_fiscal_year,  # Use extracted if available
+                        "requested_quarter": extracted_quarter or requested_quarter,  # Use extracted if available
                         "skip_transcript_retrieval": True,  # Signal that transcript is already retrieved
                     }
                 else:
