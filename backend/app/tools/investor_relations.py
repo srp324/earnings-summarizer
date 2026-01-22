@@ -385,7 +385,7 @@ class TranscriptTool(BaseTool):
                 else:
                     return f"**Error:** Could not find any available transcripts for {symbol_upper}. Please use list_earnings_transcripts to see available transcripts."
             
-            logger.info(f"Fetching earnings transcript for {symbol_upper} FY{fiscal_year} Q{quarter} from discountingcashflows.com")
+            logger.info(f"Fetching earnings report transcript for {symbol_upper} FY{fiscal_year} Q{quarter} from discountingcashflows.com")
             
             # First, try to get the transcripts list page to find the specific transcript link
             list_url = f"{DCF_BASE_URL}/company/{symbol_upper}/transcripts/"

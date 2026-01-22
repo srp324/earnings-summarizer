@@ -375,7 +375,7 @@ DO NOT use list_earnings_transcripts - proceed directly to the next step.
                         logger.info(f"Embeddings already exist for {ticker_symbol} FY{requested_fiscal_year} Q{requested_quarter}, skipping transcript retrieval")
                         # Store metadata in state for use in summarizer
                         # Add a message to make the stage visible - keep it as "retrieving_transcript" stage so "Retrieving Reports" is shown
-                        message = AIMessage(content=f"Transcript for {ticker_symbol} {requested_fiscal_year}Q{requested_quarter} has been fetched. Preparing for analysis...")
+                        message = AIMessage(content=f"Earnings report transcript for {ticker_symbol} {requested_fiscal_year}Q{requested_quarter} has been fetched. Preparing for analysis...")
                         return {
                             "messages": [message],
                             "current_stage": "retrieving_transcript",  # Use retrieving_transcript so "Retrieving Reports" is shown
@@ -388,7 +388,7 @@ DO NOT use list_earnings_transcripts - proceed directly to the next step.
                     else:
                         logger.info(f"Embeddings do not exist for {ticker_symbol} FY{requested_fiscal_year} Q{requested_quarter}, will retrieve transcript")
                         # Add a message to make the stage visible
-                        message = AIMessage(content=f"Fetching transcript for {ticker_symbol} {requested_fiscal_year}Q{requested_quarter}...")
+                        message = AIMessage(content=f"Fetching earnings report transcript for {ticker_symbol} {requested_fiscal_year}Q{requested_quarter}...")
                         return {
                             "messages": [message],
                             "current_stage": "retrieving_transcript",
@@ -431,7 +431,7 @@ DO NOT use list_earnings_transcripts - proceed directly to the next step.
                     
                     # Build user-friendly message with ticker/year/quarter if available
                     if ticker_symbol and extracted_fiscal_year and extracted_quarter:
-                        message_content = f"Transcript for {ticker_symbol} FY{extracted_fiscal_year} Q{extracted_quarter} has been fetched. Preparing for analysis..."
+                        message_content = f"Earnings report transcript for {ticker_symbol} FY{extracted_fiscal_year} Q{extracted_quarter} has been fetched. Preparing for analysis..."
                     elif ticker_symbol:
                         message_content = f"Latest earnings report transcript for {ticker_symbol} has been fetched. Preparing for analysis..."
                     else:
