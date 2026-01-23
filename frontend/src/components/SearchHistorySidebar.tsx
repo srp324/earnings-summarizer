@@ -37,23 +37,28 @@ export function SearchHistorySidebar({
   const [loading, setLoading] = useState(false)
 
   useEffect(() => {
-    if (isOpen && sessionId) {
+    if (isOpen) {
       fetchHistory()
     }
   }, [isOpen, sessionId])
 
   const fetchHistory = async () => {
-    if (!sessionId) return
-    
     setLoading(true)
     try {
-      const response = await fetch(`/api/v1/sessions/${sessionId}/history`)
+      // Always fetch from all sessions to show complete search history
+      // This ensures users can see all their previous searches, not just from the current session
+      const sessionIdToUse = sessionId || 'all'
+      const response = await fetch(`/api/v1/sessions/${sessionIdToUse}/history?all_sessions=true`)
       if (response.ok) {
         const data = await response.json()
         setHistory(data.searches || [])
+      } else if (response.status === 404) {
+        // Session doesn't exist (maybe was cleared), show empty history
+        setHistory([])
       }
     } catch (error) {
       console.error('Error fetching search history:', error)
+      setHistory([])
     } finally {
       setLoading(false)
     }

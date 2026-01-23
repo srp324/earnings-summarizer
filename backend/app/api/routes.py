@@ -270,7 +270,15 @@ async def chat_stream(
             # If request.session_id is None, a new session will be created with fresh state
             # This happens when user goes back to homepage and starts a new conversation
             session_manager = get_session_manager()
-            session = session_manager.get_or_create_session(request.session_id)
+            
+            # If session_id is None or empty, always create a new session
+            # This ensures each new conversation gets its own session and search history
+            if not request.session_id:
+                session = session_manager.get_or_create_session(None)  # None forces new session creation
+                logger.info(f"Created new session for new conversation: {session.session_id}")
+            else:
+                session = session_manager.get_or_create_session(request.session_id)
+                logger.info(f"Using existing session: {session.session_id}")
             
             # Add user message to history
             session.add_message("user", request.message)
@@ -1189,20 +1197,34 @@ async def get_metrics_history_endpoint(
 @router.get("/sessions/{session_id}/history", response_model=SearchHistoryResponse)
 async def get_session_search_history(
     session_id: str,
+    all_sessions: bool = False,  # Query parameter to get history from all sessions
 ):
-    """Get search history for a session."""
+    """
+    Get search history for a session.
+    
+    If all_sessions=true, returns history from ALL sessions (not just the specified one).
+    This allows users to see all their previous searches across different conversations.
+    """
     session_manager = get_session_manager()
-    session = session_manager.get_session(session_id)
     
-    if not session:
-        # Return empty history if session doesn't exist
-        return SearchHistoryResponse(
-            session_id=session_id,
-            searches=[],
-            total=0
-        )
-    
-    history = session.get_search_history()
+    if all_sessions:
+        # Get history from all sessions
+        history = session_manager.get_all_search_history()
+        logger.info(f"Fetching search history from all sessions: {len(history)} total entries")
+    else:
+        # Get history from specific session
+        session = session_manager.get_session(session_id)
+        
+        if not session:
+            # Return empty history if session doesn't exist
+            return SearchHistoryResponse(
+                session_id=session_id,
+                searches=[],
+                total=0
+            )
+        
+        history = session.get_search_history()
+        logger.info(f"Fetching search history for session {session_id}: {len(history)} entries")
     
     # Convert to SearchHistoryEntry objects (include messages and reasoning for restoration)
     search_entries = [
@@ -1223,7 +1245,7 @@ async def get_session_search_history(
     ]
     
     return SearchHistoryResponse(
-        session_id=session_id,
+        session_id=session_id if not all_sessions else "all",
         searches=search_entries,
         total=len(search_entries)
     )

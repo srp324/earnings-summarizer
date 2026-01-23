@@ -189,6 +189,19 @@ class SessionManager:
     def get_session_count(self) -> int:
         """Get count of active sessions."""
         return len(self._sessions)
+    
+    def get_all_search_history(self) -> List[Dict[str, Any]]:
+        """Get search history from all sessions, sorted by most recent first."""
+        all_entries = []
+        for session in self._sessions.values():
+            for entry in session.search_history:
+                # Add session_id to each entry so we know which session it belongs to
+                entry_with_session = entry.copy()
+                entry_with_session["session_id"] = session.session_id
+                all_entries.append(entry_with_session)
+        
+        # Sort by timestamp, most recent first
+        return sorted(all_entries, key=lambda x: x.get("timestamp", ""), reverse=True)
 
 
 # Global session manager instance

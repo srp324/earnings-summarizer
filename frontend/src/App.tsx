@@ -618,9 +618,9 @@ function App() {
 
   const exampleQueries = [
     'Apple',
-    'NVDA',
+    'GOOGL',
     'Microsoft',
-    'Tesla',
+    'TSLA',
   ]
 
   return (
@@ -689,6 +689,8 @@ function App() {
                 setShowWelcome(true)
                 resetStages()
                 // Reset session to start a completely new conversation
+                // Setting to null ensures the next query creates a NEW session
+                // This prevents overwriting previous session's search history
                 setSessionId(null)
                 sessionIdRef.current = null
                 isCancelledRef.current = false // Reset cancellation flag
@@ -1172,6 +1174,12 @@ function App() {
             // Restore messages to state
             setMessages(restoredMessages)
             setShowWelcome(false)
+            
+            // IMPORTANT: Don't change sessionId when restoring
+            // The search history entry belongs to whatever session it was created in
+            // We're just viewing/restoring the messages, not switching sessions
+            // This ensures that when user resets and starts a new query, it creates a NEW session
+            // and doesn't overwrite the previous session's search history
             
             // Don't auto-scroll - let user control their view position
           } else if (entry.query) {
