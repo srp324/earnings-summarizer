@@ -130,33 +130,75 @@ def extract_metric_value(data: Dict[str, Any], metric_ids: List[str]) -> Optiona
     if not data:
         return None
     
-    # Normalize all data keys to lowercase for matching
-    data_keys_lower = {k.lower(): k for k in data.keys()}
+    # Normalize all data keys for matching (convert camelCase to kebab-case, then lowercase)
+    # This ensures that "operatingCashFlow" from data-dev matches "operating-cash-flow" searches
+    data_keys_normalized = {}
+    for key in data.keys():
+        normalized_key = normalize_metric_id(key).lower()
+        # Store both the normalized key and the original key for lookup
+        if normalized_key not in data_keys_normalized:
+            data_keys_normalized[normalized_key] = []
+        data_keys_normalized[normalized_key].append(key)
     
     for metric_id in metric_ids:
         normalized_id = normalize_metric_id(metric_id).lower()
         
-        # Strategy 1: Try exact match (case-insensitive)
-        if normalized_id in data_keys_lower:
-            actual_key = data_keys_lower[normalized_id]
-            value = data[actual_key].get('value')
-            if value is not None:
-                try:
-                    return float(value)
-                except (ValueError, TypeError):
-                    pass
-        
-        # Strategy 2: Try partial/substring matching
-        # Look for keys that contain the metric_id or vice versa
-        for key_lower, actual_key in data_keys_lower.items():
-            # Check if normalized_id is contained in key or key is contained in normalized_id
-            if normalized_id in key_lower or key_lower in normalized_id:
+        # Strategy 1: Try exact match (case-insensitive, normalized)
+        if normalized_id in data_keys_normalized:
+            # Try all keys that normalize to this ID (in case of duplicates)
+            for actual_key in data_keys_normalized[normalized_id]:
                 value = data[actual_key].get('value')
                 if value is not None:
                     try:
+                        logger.debug(f"Exact match found for '{metric_id}': key='{actual_key}', value={value}")
                         return float(value)
                     except (ValueError, TypeError):
                         pass
+        
+        # Strategy 2: Try partial/substring matching on normalized keys
+        for normalized_key, actual_keys in data_keys_normalized.items():
+            # Check if normalized_id is contained in normalized_key or vice versa
+            if normalized_id in normalized_key or normalized_key in normalized_id:
+                for actual_key in actual_keys:
+                    value = data[actual_key].get('value')
+                    if value is not None:
+                        try:
+                            logger.debug(f"Substring match found for '{metric_id}': key='{actual_key}', normalized='{normalized_key}', value={value}")
+                            return float(value)
+                        except (ValueError, TypeError):
+                            pass
+    
+    # Strategy 3: Semantic matching - look for key terms in metric IDs and names
+    # This helps when the exact ID doesn't match but the concept is the same
+    # Extract key terms from the search metric_ids (e.g., "operating", "cash", "flow")
+    key_terms = set()
+    for mid in metric_ids:
+        normalized = normalize_metric_id(mid).lower()
+        # Split by common separators and add meaningful words
+        words = re.split(r'[-_\s]+', normalized)
+        key_terms.update([w for w in words if len(w) > 2])  # Only words longer than 2 chars
+    
+    if key_terms:
+        # Strategy 3: Semantic matching - look for key terms in metric IDs and names
+        for normalized_key, actual_keys in data_keys_normalized.items():
+            for actual_key in actual_keys:
+                # Check if key contains multiple key terms (semantic match)
+                key_words = set(re.split(r'[-_\s]+', normalized_key))
+                # Also check the metric name
+                metric_name = data[actual_key].get('name', '').lower()
+                name_words = set(re.split(r'[-_\s]+', metric_name))
+                
+                # Count how many key terms match
+                matching_terms = key_terms.intersection(key_words.union(name_words))
+                # Require at least 2 matching terms to avoid false positives
+                if len(matching_terms) >= 2:
+                    value = data[actual_key].get('value')
+                    if value is not None:
+                        try:
+                            logger.debug(f"Semantic match found for {metric_ids[0]}: key='{actual_key}', name='{data[actual_key].get('name')}', matching_terms={matching_terms}")
+                            return float(value)
+                        except (ValueError, TypeError):
+                            pass
     
     return None
 
@@ -316,12 +358,29 @@ async def store_scraped_metrics(
         ])
         
         # Extract cash flow metrics - including camelCase from data-dev attributes
+        # Log available cash flow metric IDs for debugging (only for first period to avoid spam)
+        if period == list(all_periods)[0] and period_cash_flow:
+            available_cf_keys = list(period_cash_flow.keys())
+            logger.info(f"Available cash flow metric IDs for {period} (first 20): {available_cf_keys[:20]}")
+            # Log metric names too
+            cf_metric_names = [period_cash_flow[k].get('name', 'N/A') for k in available_cf_keys[:10]]
+            logger.info(f"Sample cash flow metric names: {cf_metric_names}")
+        
         operating_cash_flow = extract_metric_value(period_cash_flow, [
             'operating-cash-flow', 'operating_cash_flow', 'operatingcashflow', 'cash-from-operations',
+            'cash-flow-from-operations', 'cash-from-operating-activities', 'operating-activities-cash',
+            'net-cash-from-operations', 'net-cash-operations', 'cash-operations',
             # CamelCase variations from data-dev
             'netCashProvidedByOperatingActivities', 'netCashProvidedByOperating', 'cashFromOperations',
-            'operatingCashFlow', 'netCashFromOperatingActivities'
+            'operatingCashFlow', 'netCashFromOperatingActivities', 'cashFlowFromOperations',
+            'cashFromOperatingActivities', 'operatingActivitiesCash', 'netCashFromOperations',
+            'netCashOperations', 'cashOperations', 'cashProvidedByOperatingActivities',
+            # Additional variations
+            'net-cash-provided-by-operating-activities', 'cash-provided-by-operating-activities'
         ])
+        if operating_cash_flow is None and period_cash_flow:
+            logger.debug(f"Operating cash flow not found for {period}. Available keys: {list(period_cash_flow.keys())[:15]}")
+        
         free_cash_flow = extract_metric_value(period_cash_flow, [
             'free-cash-flow', 'free_cash_flow', 'freecashflow', 'fcf',
             # CamelCase variations from data-dev

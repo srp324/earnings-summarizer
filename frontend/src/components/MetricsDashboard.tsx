@@ -311,10 +311,8 @@ export function MetricsDashboard({ tickerSymbol, currentMetrics }: MetricsDashbo
     .reverse()
     .map(m => ({
       period: m.period,
-      // Swap: fcf shows operating_cash_flow data, ocf shows free_cash_flow data
-      // (The data appears to be stored backwards in the database)
-      fcf: (m.operating_cash_flow || 0) / 1000000, // Convert to millions - showing Operating Cash Flow
-      ocf: (m.free_cash_flow || 0) / 1000000, // Convert to millions - showing Free Cash Flow
+      fcf: (m.free_cash_flow || 0) / 1000000, // Convert to millions - Free Cash Flow
+      ocf: (m.operating_cash_flow || 0) / 1000000, // Convert to millions - Operating Cash Flow
     }))
 
   // Check if we have any chartable data
@@ -510,12 +508,11 @@ export function MetricsDashboard({ tickerSymbol, currentMetrics }: MetricsDashbo
                     const color = item.color || '#94a3b8'
                     
                     // Determine label based on dataKey
-                    // Note: fcf shows operating_cash_flow data, ocf shows free_cash_flow data (swapped)
                     let label: string
                     if (dataKey === 'fcf') {
-                      label = 'Operating Cash Flow'  // fcf displays operating cash flow data
+                      label = 'Free Cash Flow'
                     } else if (dataKey === 'ocf') {
-                      label = 'Free Cash Flow'  // ocf displays free cash flow data
+                      label = 'Operating Cash Flow'
                     } else {
                       label = 'Cash Flow'
                     }
@@ -557,8 +554,8 @@ export function MetricsDashboard({ tickerSymbol, currentMetrics }: MetricsDashbo
                 }}
               />
               <Legend />
-              <Bar dataKey="fcf" fill="#10b981" name="Operating Cash Flow ($M)" />
-              <Bar dataKey="ocf" fill="#3b82f6" name="Free Cash Flow ($M)" />
+              <Bar dataKey="fcf" fill="#10b981" name="Free Cash Flow ($M)" />
+              <Bar dataKey="ocf" fill="#3b82f6" name="Operating Cash Flow ($M)" />
             </BarChart>
           </ResponsiveContainer>
         </div>

@@ -755,32 +755,56 @@ async def chat_stream(
                     logger.info(f"Using ticker_symbol '{ticker_symbol_for_scraping}' from previous analysis for scraping (current result has no ticker_symbol)")
                 
                 if ticker_symbol_for_scraping:
-                    logger.info(f"Ticker symbol found: {ticker_symbol_for_scraping}, sending metrics dashboard message")
+                    logger.info(f"Ticker symbol found: {ticker_symbol_for_scraping}, sending metrics dashboard loading message")
                     try:
-                        # Send loading message first, before starting the scrape
+                        # Send loading message immediately after summary (non-blocking)
+                        # This allows the summary to appear right away while scraping happens in background
                         loading_message = {
                             'type': 'metrics_dashboard_loading',
                             'session_id': session.session_id,
                             'ticker_symbol': ticker_symbol_for_scraping,
                             'company_name': company_name_for_storage or ticker_symbol_for_scraping,
-                            'message': 'Loading financial metric charts...',
+                            'message': 'Gathering financial metrics, please wait...',
                             'is_complete': False
                         }
                         logger.info(f"Sending metrics_dashboard_loading message for {ticker_symbol_for_scraping}")
                         yield f"data: {json.dumps(loading_message)}\n\n"
                         
-                        # Trigger scraping in background (don't wait for it)
-                        # ticker_symbol is what's used for scraping (URL construction)
-                        # company_name is just for database storage/display
-                        asyncio.create_task(
-                            scrape_and_store_metrics(
-                                ticker_symbol=ticker_symbol_for_scraping,
-                                company_name=company_name_for_storage or ticker_symbol_for_scraping,
-                                session_id=session.session_id
-                            )
-                        )
+                        # Start scraping in background (non-blocking)
+                        # The frontend will show the loading state while scraping happens
+                        logger.info(f"Starting background scrape for {ticker_symbol_for_scraping}...")
                         
-                        # Send a separate message for the metrics dashboard (after loading message)
+                        # Create a background task for scraping
+                        async def scrape_and_send_metrics():
+                            """Background task to scrape metrics and send completion message."""
+                            try:
+                                # Create a new database session for the scraping task
+                                from app.database import AsyncSessionLocal
+                                async with AsyncSessionLocal() as scrape_db:
+                                    scraped_data = await scrape_company_financials(ticker_symbol_for_scraping.upper())
+                                    if scraped_data and any(scraped_data.values()):
+                                        await store_scraped_metrics(
+                                            db=scrape_db,
+                                            ticker_symbol=ticker_symbol_for_scraping.upper(),
+                                            company_name=company_name_for_storage or ticker_symbol_for_scraping,
+                                            scraped_data=scraped_data,
+                                            session_id=session.session_id
+                                        )
+                                        logger.info(f"Successfully scraped and stored metrics for {ticker_symbol_for_scraping}")
+                                    else:
+                                        logger.warning(f"No scraped data found for {ticker_symbol_for_scraping}")
+                                
+                                # Note: We can't send SSE messages from a background task
+                                # The frontend will poll for updates or we can use a different mechanism
+                                # For now, the frontend polling will detect the new data
+                            except Exception as e:
+                                logger.error(f"Error in background metrics scrape for {ticker_symbol_for_scraping}: {e}", exc_info=True)
+                        
+                        # Start the background task (non-blocking)
+                        asyncio.create_task(scrape_and_send_metrics())
+                        
+                        # Immediately send metrics dashboard message (frontend will show loading state)
+                        # The actual data will be available when scraping completes and frontend polls
                         metrics_message = {
                             'type': 'metrics_dashboard',
                             'session_id': session.session_id,
@@ -788,7 +812,7 @@ async def chat_stream(
                             'company_name': company_name_for_storage or ticker_symbol_for_scraping,
                             'is_complete': True
                         }
-                        logger.info(f"Sending metrics_dashboard message for {ticker_symbol_for_scraping}")
+                        logger.info(f"Sending metrics_dashboard message for {ticker_symbol_for_scraping} (scraping in background)")
                         yield f"data: {json.dumps(metrics_message)}\n\n"
                     except Exception as e:
                         logger.error(f"Error triggering metrics scrape: {e}", exc_info=True)
