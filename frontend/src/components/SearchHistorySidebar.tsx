@@ -5,6 +5,7 @@ import { History, X, ChevronLeft } from 'lucide-react'
 interface SearchHistoryEntry {
   id: string
   timestamp: string
+  session_id?: string
   ticker_symbol?: string
   company_name?: string
   fiscal_year?: string

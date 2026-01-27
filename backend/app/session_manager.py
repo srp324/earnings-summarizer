@@ -32,37 +32,81 @@ class SessionData:
             "timestamp": datetime.utcnow().isoformat()
         })
         self.last_accessed = datetime.utcnow()
+        
+        # Keep the most recent search history entry in sync with the full
+        # conversation so restores can bring back ALL messages, not just
+        # the state at initial analysis.
+        if self.search_history:
+            latest = self.search_history[-1]
+            latest["message_count"] = len(self.conversation_history)
+            latest["messages"] = self.conversation_history.copy()
     
     def set_analysis(self, analysis: Dict[str, Any]):
         """Store the latest analysis result."""
         self.last_analysis = analysis
         self.last_accessed = datetime.utcnow()
         
-        # Add to search history when analysis is completed
-        # Store a snapshot of the conversation at this point
-        search_entry = {
-            "id": str(uuid.uuid4()),
-            "timestamp": datetime.utcnow().isoformat(),
-            "ticker_symbol": analysis.get("ticker_symbol"),
-            "company_name": analysis.get("company_name"),
-            "fiscal_year": analysis.get("requested_fiscal_year"),
-            "fiscal_quarter": analysis.get("requested_quarter"),
-            "query": analysis.get("company_query", ""),
-            "action": "analysis",
-            "message_count": len(self.conversation_history),  # Store how many messages at this point
-            "messages": self.conversation_history.copy(),  # Store snapshot of messages
-            "stage_reasoning": analysis.get("stage_reasoning", {})  # Store reasoning for each stage
-        }
-        self.search_history.append(search_entry)
-        # Keep only last 50 searches to avoid memory issues
-        if len(self.search_history) > 50:
-            self.search_history = self.search_history[-50:]
+        # Add to or update search history when analysis is completed.
+        # We treat the session as a single "thread", so multiple analyses
+        # in the same conversation update the most recent analysis entry
+        # instead of creating separate cards in the history.
+        if self.search_history and self.search_history[-1].get("action") == "analysis":
+            # Update the existing latest analysis entry
+            entry = self.search_history[-1]
+            entry["timestamp"] = datetime.utcnow().isoformat()
+            entry["ticker_symbol"] = analysis.get("ticker_symbol")
+            entry["company_name"] = analysis.get("company_name")
+            entry["fiscal_year"] = analysis.get("requested_fiscal_year")
+            entry["fiscal_quarter"] = analysis.get("requested_quarter")
+            entry["query"] = analysis.get("company_query", "")
+            entry["message_count"] = len(self.conversation_history)
+            entry["messages"] = self.conversation_history.copy()
+            # Merge or replace stage reasoning
+            new_stage_reasoning = analysis.get("stage_reasoning", {}) or {}
+            existing_stage_reasoning = entry.get("stage_reasoning") or {}
+            existing_stage_reasoning.update(new_stage_reasoning)
+            entry["stage_reasoning"] = existing_stage_reasoning
+        else:
+            # Create a new analysis entry for this session
+            search_entry = {
+                "id": str(uuid.uuid4()),
+                "timestamp": datetime.utcnow().isoformat(),
+                "ticker_symbol": analysis.get("ticker_symbol"),
+                "company_name": analysis.get("company_name"),
+                "fiscal_year": analysis.get("requested_fiscal_year"),
+                "fiscal_quarter": analysis.get("requested_quarter"),
+                "query": analysis.get("company_query", ""),
+                "action": "analysis",
+                "message_count": len(self.conversation_history),  # Store how many messages at this point
+                "messages": self.conversation_history.copy(),  # Store snapshot of messages
+                "stage_reasoning": analysis.get("stage_reasoning", {})  # Store reasoning for each stage
+            }
+            self.search_history.append(search_entry)
+            # Keep only last 50 searches to avoid memory issues
+            if len(self.search_history) > 50:
+                self.search_history = self.search_history[-50:]
     
-    def add_search_entry(self, query: str, action: str = "chat", ticker_symbol: Optional[str] = None, 
-                        fiscal_year: Optional[str] = None, fiscal_quarter: Optional[str] = None):
-        """Add a search entry for general chat messages (first message in conversation)."""
-        # Only add if it's the first message or if it's a chat without analysis
-        if action == "chat" and not self.search_history:
+    def add_search_entry(
+        self,
+        query: str,
+        action: str = "chat",
+        ticker_symbol: Optional[str] = None,
+        fiscal_year: Optional[str] = None,
+        fiscal_quarter: Optional[str] = None,
+        force: bool = False,
+    ):
+        """
+        Add a search entry for general chat messages (first message in conversation),
+        or a full snapshot when explicitly saving the conversation.
+        
+        - Default behavior (force=False): only adds the very first chat entry so we
+          don't spam history on every message.
+        - When force=True (used by explicit "save conversation"), always append a
+          new entry containing a full snapshot of the current conversation_history.
+        """
+        # Only add automatically for the first chat entry,
+        # but allow explicit saves to force a new snapshot.
+        if action == "chat" and (force or not self.search_history):
             search_entry = {
                 "id": str(uuid.uuid4()),
                 "timestamp": datetime.utcnow().isoformat(),

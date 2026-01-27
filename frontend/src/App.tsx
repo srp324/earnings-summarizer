@@ -19,6 +19,7 @@ interface Message {
 interface SearchHistoryEntry {
   id: string
   timestamp: string
+  session_id?: string
   ticker_symbol?: string
   company_name?: string
   fiscal_year?: string
@@ -1065,13 +1066,18 @@ function App() {
             // Process messages and reconstruct full conversation state
             let messageIndex = 0
             let hasAddedStageFlow = false
-            let summaryMessageAdded = false
             
-            // First, find the summary message (last assistant message with content)
+            // First, find the summary message (last assistant message with content),
+            // ignoring internal metrics marker messages.
             let summaryMessage: { role: string; content: string; timestamp?: string } | null = null
             for (let i = entry.messages.length - 1; i >= 0; i--) {
               const msg = entry.messages[i]
-              if (msg.role === 'assistant' && msg.content && msg.content.trim()) {
+              if (
+                msg.role === 'assistant' &&
+                msg.content &&
+                msg.content.trim() &&
+                !msg.content.startsWith('__METRICS_MESSAGE__')
+              ) {
                 summaryMessage = msg
                 console.log('[Restore] Found summary message:', { content_length: msg.content.length, content_preview: msg.content.substring(0, 100) })
                 break
@@ -1124,6 +1130,29 @@ function App() {
               
               // Add assistant messages
               if (msg.role === 'assistant') {
+                // Special handling for synthetic metrics messages recorded in the backend.
+                // These have content starting with "__METRICS_MESSAGE__{json...}".
+                if (msg.content && msg.content.startsWith('__METRICS_MESSAGE__')) {
+                  try {
+                    const jsonPart = msg.content.substring('__METRICS_MESSAGE__'.length)
+                    const parsed = JSON.parse(jsonPart) as { type?: string; ticker_symbol?: string; company_name?: string }
+                    if (parsed.type === 'metrics_dashboard' && parsed.ticker_symbol) {
+                      restoredMessages.push({
+                        id: `${entry.id}-metrics-${messageIndex++}`,
+                        role: 'assistant',
+                        content: '',
+                        timestamp,
+                        tickerSymbol: parsed.ticker_symbol,
+                        companyName: parsed.company_name,
+                      })
+                      return
+                    }
+                  } catch (e) {
+                    console.warn('[Restore] Failed to parse metrics marker message', e)
+                    // Fall through to treat as normal assistant message
+                  }
+                }
+
                 // Check if this is the summary message (last assistant message with content)
                 // Use trim for comparison to handle whitespace differences
                 const isSummaryMessage = summaryMessage && 
@@ -1141,46 +1170,25 @@ function App() {
                   timestamp,
                 }
                 
-                // For analysis entries with ticker, treat the summary message as text-only (no ticker),
-                // and add a separate metrics dashboard message immediately after it.
-                // This mirrors the live streaming behavior: one summary message, one metrics message.
-                if (entry.action === 'analysis' && entry.ticker_symbol && isSummaryMessage && !summaryMessageAdded) {
-                  console.log('[Restore] Adding summary message for analysis entry with ticker:', entry.ticker_symbol)
-                  restoredMessages.push(restoredMessage)
-                  summaryMessageAdded = true
-                  
-                  // Add metrics dashboard message immediately after summary.
-                  // This will be the ONLY message that contains the tickerSymbol,
-                  // so only one metrics dashboard is rendered on restore.
-                  console.log('[Restore] Adding metrics dashboard message')
-                  restoredMessages.push({
-                    id: `${entry.id}-metrics`,
-                    role: 'assistant',
-                    content: '',
-                    timestamp: new Date(timestamp.getTime() + 1000), // Slightly after summary
-                    tickerSymbol: entry.ticker_symbol,
-                    companyName: entry.company_name,
-                  })
-                } else {
-                  // All other assistant messages (including non-summary or already processed summary)
-                  // Only skip if this is the summary and we already added it
-                  if (!(isSummaryMessage && summaryMessageAdded)) {
-                    restoredMessages.push(restoredMessage)
-                  }
-                }
+                // Add all assistant messages normally; metrics dashboards are handled
+                // separately via synthetic "__METRICS_MESSAGE__" entries above.
+                restoredMessages.push(restoredMessage)
               }
             })
             
             // Restore messages to state
             setMessages(restoredMessages)
             setShowWelcome(false)
-            
-            // IMPORTANT: Don't change sessionId when restoring
-            // The search history entry belongs to whatever session it was created in
-            // We're just viewing/restoring the messages, not switching sessions
-            // This ensures that when user resets and starts a new query, it creates a NEW session
-            // and doesn't overwrite the previous session's search history
-            
+
+            // When restoring a conversation, switch the active session to the one
+            // that originally owned this history entry so follow-up questions
+            // continue in the same backend session (and reuse its analysis state).
+            if (entry.session_id) {
+              console.log('[Restore] Switching active session to', entry.session_id)
+              sessionIdRef.current = entry.session_id
+              setSessionId(entry.session_id)
+            }
+
             // Don't auto-scroll - let user control their view position
           } else if (entry.query) {
             // Fallback: if no messages stored, restore by re-submitting query

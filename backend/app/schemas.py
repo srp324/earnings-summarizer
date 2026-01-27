@@ -102,6 +102,7 @@ class SearchHistoryEntry(BaseModel):
     """A single entry in the search history."""
     id: str = Field(..., description="Unique entry identifier")
     timestamp: str = Field(..., description="ISO timestamp when search was performed")
+    session_id: Optional[str] = Field(None, description="Session ID this history entry belongs to")
     ticker_symbol: Optional[str] = Field(None, description="Company ticker symbol")
     company_name: Optional[str] = Field(None, description="Company name")
     fiscal_year: Optional[str] = Field(None, description="Fiscal year (e.g., '2024')")

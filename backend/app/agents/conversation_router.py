@@ -203,6 +203,19 @@ them in your extracted_company field (e.g., "NVDA 2022 Q1").""")
             previous_message=previous_message
         )
         
+        # Heuristic fix: reclassify certain general_chat messages as follow-ups
+        # when we clearly have an active analysis and the user is asking about
+        # metrics/financial details without specifying a new company.
+        user_lower = user_input.lower()
+        if classification.intent == "general_chat" and has_active_analysis:
+            metrics_keywords = ["metric", "metrics", "financial metrics", "latest metrics"]
+            if any(keyword in user_lower for keyword in metrics_keywords):
+                logger.info(
+                    "Reclassifying general_chat as follow_up_question based on "
+                    "metrics-related query and existing last_analysis"
+                )
+                classification.intent = "follow_up_question"
+
         # Determine action
         if classification.intent == "new_analysis":
             action = "analyze"

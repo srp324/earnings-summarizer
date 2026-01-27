@@ -814,6 +814,22 @@ async def chat_stream(
                         }
                         logger.info(f"Sending metrics_dashboard message for {ticker_symbol_for_scraping} (scraping in background)")
                         yield f"data: {json.dumps(metrics_message)}\n\n"
+
+                        # Also record a synthetic assistant message in the session history
+                        # so that metrics dashboards can be restored in their original
+                        # position within the conversation thread.
+                        try:
+                            metrics_marker = {
+                                "type": "metrics_dashboard",
+                                "ticker_symbol": ticker_symbol_for_scraping,
+                                "company_name": company_name_for_storage or ticker_symbol_for_scraping,
+                            }
+                            session.add_message(
+                                "assistant",
+                                "__METRICS_MESSAGE__" + json.dumps(metrics_marker),
+                            )
+                        except Exception as marker_err:
+                            logger.warning(f"Failed to record metrics dashboard message in session history: {marker_err}")
                     except Exception as e:
                         logger.error(f"Error triggering metrics scrape: {e}", exc_info=True)
                 else:
@@ -1255,6 +1271,7 @@ async def get_session_search_history(
         SearchHistoryEntry(
             id=entry["id"],
             timestamp=entry["timestamp"],
+            session_id=entry.get("session_id", session_id if all_sessions else session_id),
             ticker_symbol=entry.get("ticker_symbol"),
             company_name=entry.get("company_name"),
             fiscal_year=entry.get("fiscal_year"),
@@ -1341,10 +1358,21 @@ async def save_current_conversation(
             first_user_message = msg.get("content", "")
             break
     
-    # Save as a chat entry
+    # Use last analysis metadata (if any) to enrich the saved snapshot
+    last_analysis = session.last_analysis or {}
+    
+    # Save as a chat entry with a FULL snapshot of the current conversation.
+    # This is an explicit "save", so we force creation of a new history entry
+    # even if there are existing ones for this session.
     session.add_search_entry(
-        query=first_user_message or "Conversation",
-        action="chat"
+        query=first_user_message
+        or last_analysis.get("company_query")
+        or "Conversation",
+        action="chat",
+        ticker_symbol=last_analysis.get("ticker_symbol"),
+        fiscal_year=last_analysis.get("requested_fiscal_year"),
+        fiscal_quarter=last_analysis.get("requested_quarter"),
+        force=True,
     )
     
     return {
