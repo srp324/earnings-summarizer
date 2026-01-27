@@ -1141,17 +1141,17 @@ function App() {
                   timestamp,
                 }
                 
-                // For analysis entries with ticker, mark summary message and add metrics dashboard
+                // For analysis entries with ticker, treat the summary message as text-only (no ticker),
+                // and add a separate metrics dashboard message immediately after it.
+                // This mirrors the live streaming behavior: one summary message, one metrics message.
                 if (entry.action === 'analysis' && entry.ticker_symbol && isSummaryMessage && !summaryMessageAdded) {
-                  // This is the summary message - add ticker symbol
-                  restoredMessage.tickerSymbol = entry.ticker_symbol
-                  restoredMessage.companyName = entry.company_name
-                  
-                  console.log('[Restore] Adding summary message with ticker:', entry.ticker_symbol)
+                  console.log('[Restore] Adding summary message for analysis entry with ticker:', entry.ticker_symbol)
                   restoredMessages.push(restoredMessage)
                   summaryMessageAdded = true
                   
-                  // Add metrics dashboard message immediately after summary
+                  // Add metrics dashboard message immediately after summary.
+                  // This will be the ONLY message that contains the tickerSymbol,
+                  // so only one metrics dashboard is rendered on restore.
                   console.log('[Restore] Adding metrics dashboard message')
                   restoredMessages.push({
                     id: `${entry.id}-metrics`,
